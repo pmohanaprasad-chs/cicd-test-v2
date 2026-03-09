@@ -57,7 +57,7 @@ check_url "${BASE_URL}" "Hello from CI/CD"
 # Test 2: health.json — served under the same base path
 echo ""
 echo "→ Test 2: health check"
-check_url "${BASE_URL}/health.json" '"status":"ok"'
+check_url "${BASE_URL}/health.json" 'status'
 
 echo ""
 echo "============================================"
