@@ -1,0 +1,21 @@
+# terraform/terraform.tfvars.example
+# Copy to terraform.tfvars and fill in values
+
+aws_region   = "us-east-1"
+project_name = "cicd-demo"
+github_org   = "YOUR_GITHUB_ORG"     # FILL IN
+github_repo  = "YOUR_GITHUB_REPO"    # FILL IN
+
+vpc_cidr             = "10.0.0.0/16"
+availability_zones   = ["us-east-1a", "us-east-1b"]
+public_subnet_cidrs  = ["10.0.0.0/24", "10.0.1.0/24"]
+private_subnet_cidrs = ["10.0.10.0/24", "10.0.11.0/24"]
+
+ecs_instance_type     = "t3.small"
+asg_min_capacity      = 1
+asg_max_capacity      = 4
+dev_desired_count     = 1
+staging_desired_count = 1
+prod_desired_count    = 2
+
+# acm_certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/xxx"

@@ -1,0 +1,157 @@
+# .github/workflows/destroy.yml
+# ============================================================================
+# Destroy — tears down ALL AWS infrastructure created by Terraform
+#
+# Triggered ONLY manually via workflow_dispatch.
+# Requires typing "destroy" as confirmation to prevent accidents.
+#
+# What gets deleted:
+#   - ECS services (dev, staging, prod)
+#   - ECS cluster + capacity provider + ASG
+#   - ALB + target groups + listeners
+#   - ECR repository (and all images inside)
+#   - VPC + subnets + NAT gateway + route tables
+#   - IAM roles + policies
+#   - CloudWatch log groups
+#   - Security groups
+#
+# What is NOT deleted (kept for safety):
+#   - S3 state bucket
+#   - DynamoDB lock table
+#   - OIDC provider (shared AWS account resource)
+# ============================================================================
+name: Destroy Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Type 'destroy' to confirm you want to delete everything"
+        required: true
+        type: string
+      delete_state_backend:
+        description: 'Also delete S3 state bucket and DynamoDB table?'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  TF_VERSION: '1.7.5'
+  AWS_REGION: ${{ vars.AWS_REGION }}
+
+jobs:
+  destroy:
+    name: Terraform Destroy
+    runs-on: ubuntu-latest
+    environment: dev
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      # ── Safety check ────────────────────────────────────────────────────────
+      - name: Confirm destroy
+        if: inputs.confirm != 'destroy'
+        run: |
+          echo "❌ Confirmation failed."
+          echo "You typed: '${{ inputs.confirm }}'"
+          echo "You must type exactly: destroy"
+          exit 1
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.IAM_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: tf-destroy-${{ github.run_id }}
+          role-duration-seconds: 7200 # 2 hours — destroy can take a while
+
+      # ── Scale down ECS services first (speeds up destroy) ───────────────────
+      - name: Scale down ECS services
+        run: |
+          CLUSTER="${{ vars.PROJECT_NAME }}-cluster"
+          for ENV in dev staging prod; do
+            SERVICE="${{ vars.PROJECT_NAME }}-${ENV}"
+            echo "Scaling down $SERVICE..."
+            aws ecs update-service \
+              --cluster "$CLUSTER" \
+              --service "$SERVICE" \
+              --desired-count 0 2>/dev/null && echo "✅ $SERVICE scaled to 0" || echo "⏭️  $SERVICE not found"
+          done
+          echo "Waiting 15s for tasks to stop..."
+          sleep 15
+
+      # ── Terraform destroy ────────────────────────────────────────────────────
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Write tfvars
+        working-directory: terraform
+        run: |
+          cat > terraform.tfvars << EOF
+          aws_region   = "${{ env.AWS_REGION }}"
+          project_name = "${{ vars.PROJECT_NAME }}"
+          github_org   = "${{ vars.TF_GITHUB_ORG }}"
+          github_repo  = "${{ vars.TF_GITHUB_REPO }}"
+          EOF
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=cicd-demo/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform Destroy
+        working-directory: terraform
+        run: |
+          terraform destroy \
+            -auto-approve \
+            -input=false
+          echo "✅ All Terraform-managed resources destroyed"
+
+      # ── Optionally delete state backend ─────────────────────────────────────
+      - name: Delete state backend
+        if: inputs.delete_state_backend == true
+        run: |
+          BUCKET="${{ vars.TF_STATE_BUCKET }}"
+          TABLE="${{ vars.TF_LOCK_TABLE }}"
+
+          echo "Deleting all objects in S3 bucket..."
+          aws s3 rm s3://${BUCKET} --recursive
+
+          echo "Deleting S3 bucket versions..."
+          aws s3api delete-objects \
+            --bucket "$BUCKET" \
+            --delete "$(aws s3api list-object-versions \
+              --bucket "$BUCKET" \
+              --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' \
+              --output json)" 2>/dev/null || true
+
+          aws s3api delete-bucket --bucket "$BUCKET" && \
+            echo "✅ Deleted S3 bucket: $BUCKET" || true
+
+          aws dynamodb delete-table --table-name "$TABLE" && \
+            echo "✅ Deleted DynamoDB table: $TABLE" || true
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## 💥 Infrastructure Destroyed" >> $GITHUB_STEP_SUMMARY
+          echo "Triggered by: ${{ github.actor }}"    >> $GITHUB_STEP_SUMMARY
+          echo "Time: $(date -u)"                     >> $GITHUB_STEP_SUMMARY
+          if [[ "${{ inputs.delete_state_backend }}" == "true" ]]; then
+            echo "State backend: **deleted**"         >> $GITHUB_STEP_SUMMARY
+          else
+            echo "State backend: kept (S3 + DynamoDB still exist)" >> $GITHUB_STEP_SUMMARY
+          fi

@@ -1,0 +1,45 @@
+# Git
+.git
+.gitignore
+
+# Node
+node_modules
+npm-debug.log*
+
+# Next.js build output (will be rebuilt inside Docker)
+.next
+out
+
+# Tests & coverage
+coverage
+__tests__
+*.test.ts
+*.test.tsx
+*.spec.ts
+*.spec.tsx
+jest.config.*
+
+# Local env files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Editor / OS
+.DS_Store
+*.swp
+*.swo
+.idea
+.vscode
+
+# CI artifacts
+.github
+
+# Terraform
+terraform
+infra
+
+# Misc
+README.md
+CHANGELOG.md

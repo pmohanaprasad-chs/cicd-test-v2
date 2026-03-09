@@ -1,0 +1,35 @@
+# Node
+node_modules/
+npm-debug.log*
+.pnpm-debug.log*
+
+# Next.js
+app/.next/
+app/out/
+app/coverage/
+
+# Terraform
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/.terraform.lock.hcl
+terraform/terraform.tfvars
+!terraform/terraform.tfvars.example
+*.tfplan
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test artifacts
+coverage/
+.nyc_output/
