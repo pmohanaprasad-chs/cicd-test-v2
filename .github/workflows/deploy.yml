@@ -32,8 +32,6 @@ env:
 
 # ============================================================================
 # JOB 1 – Provision infrastructure (idempotent — safe to run every time)
-# Creates ECR, ECS cluster, ALB, services if they don't exist.
-# Skips apply entirely if nothing has changed (terraform plan exit code 0).
 # ============================================================================
 jobs:
   provision-infra:
@@ -148,7 +146,6 @@ jobs:
           terraform plan -detailed-exitcode -out=tfplan -input=false
           EXIT=$?
           set -e
-          # 0 = no changes, 1 = error, 2 = changes pending
           if   [[ $EXIT -eq 0 ]]; then echo "result=no_changes" >> "$GITHUB_OUTPUT"
           elif [[ $EXIT -eq 2 ]]; then echo "result=changes"    >> "$GITHUB_OUTPUT"
           else exit 1
@@ -165,7 +162,6 @@ jobs:
         id: outputs
         working-directory: terraform
         run: |
-          # Re-init without wrapper to get clean output
           terraform init -reconfigure \
             -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
             -backend-config="key=cicd-demo/terraform.tfstate" \
@@ -201,31 +197,24 @@ jobs:
         run: |
           ALB="http://${{ steps.outputs.outputs.alb_dns }}"
           REPO="${{ github.repository }}"
-          ALB_DEV="${ALB}/dev"
-          ALB_STAGING="${ALB}/staging"
 
-          gh variable set "DEV_URL"     --body "$ALB_DEV" --env dev     --repo "$REPO"
-          gh variable set "STAGING_URL" --body "$ALB_STAGING" --env staging --repo "$REPO"
-          gh variable set "PROD_URL"    --body "$ALB" --env prod    --repo "$REPO"
+          gh variable set "DEV_URL"     --body "${ALB}/dev"     --env dev     --repo "$REPO"
+          gh variable set "STAGING_URL" --body "${ALB}/staging" --env staging --repo "$REPO"
+          gh variable set "PROD_URL"    --body "$ALB"           --env prod    --repo "$REPO"
 
           echo "✅ URLs synced: $ALB"
 
       - name: Print ALB URL
         run: |
           ALB="http://${{ steps.outputs.outputs.alb_dns }}"
-          ALB_DEV="${ALB}/dev"
-          ALB_STAGING="${ALB}/staging"
           echo "## 🌐 ALB URL" >> $GITHUB_STEP_SUMMARY
           echo "$ALB" >> $GITHUB_STEP_SUMMARY
-          echo ""
-          echo "If this is a new ALB, update these GitHub environment variables manually:"
-          echo "  DEV_URL     = $ALB_DEV"
-          echo "  STAGING_URL = $ALB_STAGING"
-          echo "  PROD_URL    = $ALB"
+          echo "DEV_URL     = ${ALB}/dev"
+          echo "STAGING_URL = ${ALB}/staging"
+          echo "PROD_URL    = $ALB"
 
   # ============================================================================
   # JOB 2 – Build & push Docker image to ECR
-  # ECR is guaranteed to exist because provision-infra ran first
   # ============================================================================
   build-and-push:
     name: Build & Push to ECR
@@ -347,12 +336,23 @@ jobs:
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Download current task definition
+      - name: Download & patch task definition
         run: |
           aws ecs describe-task-definition \
             --task-definition ${{ vars.ECS_TASK_FAMILY_DEV }} \
             --query taskDefinition \
             --output json > task-def-dev.json
+
+          # Inject APP_ENV and BUILD_SHA directly into the JSON
+          jq '(.containerDefinitions[0].environment) |=
+            (map(select(.name != "APP_ENV" and .name != "BUILD_SHA")) +
+            [{"name":"APP_ENV","value":"dev"},
+             {"name":"BUILD_SHA","value":"${{ github.sha }}"}])' \
+            task-def-dev.json > task-def-dev-patched.json
+          mv task-def-dev-patched.json task-def-dev.json
+
+          echo "✅ Patched env vars:"
+          jq '.containerDefinitions[0].environment' task-def-dev.json
 
       - name: Render new task definition
         id: task-def
@@ -361,9 +361,6 @@ jobs:
           task-definition: task-def-dev.json
           container-name: ${{ vars.ECS_CONTAINER_NAME }}
           image: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}@${{ env.IMAGE_DIGEST }}
-          environment-variables: |
-            APP_ENV=dev
-            BUILD_SHA=${{ github.sha }}
 
       - name: Deploy to ECS (dev)
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
@@ -404,7 +401,7 @@ jobs:
 
     permissions:
       id-token: write
-      contents: write # needed to push branch merge
+      contents: write
 
     env:
       IMAGE_DIGEST: ${{ needs.build-and-push.outputs.image_digest }}
@@ -414,7 +411,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # full history needed for merge
+          fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Merge dev → staging branch
@@ -437,12 +434,23 @@ jobs:
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Download current task definition
+      - name: Download & patch task definition
         run: |
           aws ecs describe-task-definition \
             --task-definition ${{ vars.ECS_TASK_FAMILY_STAGING }} \
             --query taskDefinition \
             --output json > task-def-staging.json
+
+          # Inject APP_ENV and BUILD_SHA directly into the JSON
+          jq '(.containerDefinitions[0].environment) |=
+            (map(select(.name != "APP_ENV" and .name != "BUILD_SHA")) +
+            [{"name":"APP_ENV","value":"staging"},
+             {"name":"BUILD_SHA","value":"${{ github.sha }}"}])' \
+            task-def-staging.json > task-def-staging-patched.json
+          mv task-def-staging-patched.json task-def-staging.json
+
+          echo "✅ Patched env vars:"
+          jq '.containerDefinitions[0].environment' task-def-staging.json
 
       - name: Render new task definition
         id: task-def
@@ -451,9 +459,6 @@ jobs:
           task-definition: task-def-staging.json
           container-name: ${{ vars.ECS_CONTAINER_NAME }}
           image: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}@${{ env.IMAGE_DIGEST }}
-          environment-variables: |
-            APP_ENV=staging
-            BUILD_SHA=${{ github.sha }}
 
       - name: Deploy to ECS (staging)
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
@@ -494,7 +499,7 @@ jobs:
 
     permissions:
       id-token: write
-      contents: write # needed to push branch merge
+      contents: write
 
     env:
       IMAGE_DIGEST: ${{ needs.build-and-push.outputs.image_digest }}
@@ -504,7 +509,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # full history needed for merge
+          fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Merge staging → main branch
@@ -527,12 +532,23 @@ jobs:
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Download current task definition
+      - name: Download & patch task definition
         run: |
           aws ecs describe-task-definition \
             --task-definition ${{ vars.ECS_TASK_FAMILY_PROD }} \
             --query taskDefinition \
             --output json > task-def-prod.json
+
+          # Inject APP_ENV and BUILD_SHA directly into the JSON
+          jq '(.containerDefinitions[0].environment) |=
+            (map(select(.name != "APP_ENV" and .name != "BUILD_SHA")) +
+            [{"name":"APP_ENV","value":"production"},
+             {"name":"BUILD_SHA","value":"${{ github.sha }}"}])' \
+            task-def-prod.json > task-def-prod-patched.json
+          mv task-def-prod-patched.json task-def-prod.json
+
+          echo "✅ Patched env vars:"
+          jq '.containerDefinitions[0].environment' task-def-prod.json
 
       - name: Render new task definition
         id: task-def
@@ -541,9 +557,6 @@ jobs:
           task-definition: task-def-prod.json
           container-name: ${{ vars.ECS_CONTAINER_NAME }}
           image: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}@${{ env.IMAGE_DIGEST }}
-          environment-variables: |
-            APP_ENV=production
-            BUILD_SHA=${{ github.sha }}
 
       - name: Deploy to ECS (prod)
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
