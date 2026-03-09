@@ -1,11 +1,11 @@
 # ============================================================================
 # deploy.yml  –  Infra → Build → ECR → ECS
 #
-# Flow:
-#   push to dev
-#     └─ provision-infra → build-and-push → deploy-dev (auto)
-#         └─ deploy-staging (approval gate → auto merges dev→staging → deploys)
-#             └─ deploy-prod (approval gate → auto merges staging→main → deploys)
+# Jira flow:
+#   build-and-push  → create ticket → In Progress
+#   deploy-dev      → comment only  (stays In Progress)
+#   deploy-staging  → comment only  (stays In Progress)
+#   deploy-prod     → comment + transition to Done
 # ============================================================================
 name: Deploy
 
@@ -31,7 +31,7 @@ env:
   ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
 
 # ============================================================================
-# JOB 1 – Provision infrastructure (idempotent — safe to run every time)
+# JOB 1 – Provision infrastructure (idempotent)
 # ============================================================================
 jobs:
   provision-infra:
@@ -65,7 +65,6 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: tf-infra-${{ github.run_id }}
 
-      # ── Bootstrap: S3 state bucket + DynamoDB lock table ──────────────────
       - name: Bootstrap Terraform state backend
         run: |
           BUCKET="${{ vars.TF_STATE_BUCKET }}"
@@ -104,7 +103,6 @@ jobs:
             echo "✅ DynamoDB table exists: $TABLE"
           fi
 
-      # ── Terraform ──────────────────────────────────────────────────────────
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
@@ -154,9 +152,7 @@ jobs:
       - name: Terraform Apply
         if: steps.plan.outputs.result == 'changes'
         working-directory: terraform
-        run: |
-          terraform apply -auto-approve -input=false tfplan
-          echo "✅ Infrastructure up to date"
+        run: terraform apply -auto-approve -input=false tfplan
 
       - name: Capture Terraform outputs
         id: outputs
@@ -179,42 +175,29 @@ jobs:
           echo "task_family_staging=$(terraform output -raw task_family_staging)" >> "$GITHUB_OUTPUT"
           echo "task_family_prod=$(terraform output -raw task_family_prod)"       >> "$GITHUB_OUTPUT"
 
-      - name: Summary
-        working-directory: terraform
-        run: |
-          STATUS="${{ steps.plan.outputs.result }}"
-          if [[ "$STATUS" == "no_changes" ]]; then
-            echo "## ✅ Infrastructure unchanged" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "## 🏗️ Infrastructure updated"  >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "ALB: http://${{ steps.outputs.outputs.alb_dns }}" >> $GITHUB_STEP_SUMMARY
-          echo "ECR: ${{ steps.outputs.outputs.ecr_url }}"        >> $GITHUB_STEP_SUMMARY
-
       - name: Sync ALB URLs to GitHub variables
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           ALB="http://${{ steps.outputs.outputs.alb_dns }}"
           REPO="${{ github.repository }}"
-
           gh variable set "DEV_URL"     --body "${ALB}/dev"     --env dev     --repo "$REPO"
           gh variable set "STAGING_URL" --body "${ALB}/staging" --env staging --repo "$REPO"
           gh variable set "PROD_URL"    --body "$ALB"           --env prod    --repo "$REPO"
-
           echo "✅ URLs synced: $ALB"
 
-      - name: Print ALB URL
+      - name: Summary
+        working-directory: terraform
         run: |
+          STATUS="${{ steps.plan.outputs.result }}"
           ALB="http://${{ steps.outputs.outputs.alb_dns }}"
-          echo "## 🌐 ALB URL" >> $GITHUB_STEP_SUMMARY
-          echo "$ALB" >> $GITHUB_STEP_SUMMARY
-          echo "DEV_URL     = ${ALB}/dev"
-          echo "STAGING_URL = ${ALB}/staging"
-          echo "PROD_URL    = $ALB"
+          [[ "$STATUS" == "no_changes" ]] \
+            && echo "## ✅ Infrastructure unchanged" >> $GITHUB_STEP_SUMMARY \
+            || echo "## 🏗️ Infrastructure updated"  >> $GITHUB_STEP_SUMMARY
+          echo "ALB: $ALB" >> $GITHUB_STEP_SUMMARY
 
   # ============================================================================
-  # JOB 2 – Build & push Docker image to ECR
+  # JOB 2 – Build & push + create Jira ticket → In Progress
   # ============================================================================
   build-and-push:
     name: Build & Push to ECR
@@ -225,7 +208,7 @@ jobs:
     outputs:
       image_tag: ${{ steps.meta.outputs.image_tag }}
       image_digest: ${{ steps.push.outputs.digest }}
-      jira_key: ${{ steps.jira.outputs.jira_key }}
+      jira_key: ${{ steps.jira_create.outputs.jira_key }}
 
     permissions:
       id-token: write
@@ -252,13 +235,36 @@ jobs:
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
           echo "image_tag=sha-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
 
-      - name: Extract Jira issue key
-        id: jira
+      # ── Create Jira ticket → In Progress ───────────────────────────────────
+      - name: Create Jira task → In Progress
+        id: jira_create
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
         run: |
-          INPUT="${{ github.head_ref }}${{ github.ref_name }} ${{ github.event.head_commit.message }}"
-          JIRA_KEY=$(echo "$INPUT" | grep -oE '[A-Z][A-Z0-9]+-[0-9]+' | head -1 || true)
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          SUMMARY="Deploy #${{ github.run_number }} - ${SHORT_SHA} (${{ github.ref_name }})"
+          DESCRIPTION="Branch: ${{ github.ref_name }}
+          Commit: ${{ github.sha }}
+          Message: ${{ github.event.head_commit.message }}
+          Run: ${RUN_URL}"
+
+          JIRA_KEY=$(node scripts/jira-transition.js \
+            --action create \
+            --project CSD \
+            --summary "$SUMMARY" \
+            --description "$DESCRIPTION")
+
           echo "jira_key=${JIRA_KEY}" >> "$GITHUB_OUTPUT"
-          echo "Detected Jira key: '${JIRA_KEY}'"
+          echo "✅ Created Jira ticket: ${JIRA_KEY}"
+
+          node scripts/jira-transition.js \
+            --action transition \
+            --key "$JIRA_KEY" \
+            --status "In Progress"
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -297,14 +303,15 @@ jobs:
 
       - name: Summary
         run: |
-          echo "## 📦 Image Built" >> $GITHUB_STEP_SUMMARY
-          echo "| Key | Value |"   >> $GITHUB_STEP_SUMMARY
-          echo "|-----|-------|"   >> $GITHUB_STEP_SUMMARY
-          echo "| Tag    | \`${{ steps.meta.outputs.image_tag }}\` |"  >> $GITHUB_STEP_SUMMARY
-          echo "| Digest | \`${{ steps.push.outputs.digest }}\` |"     >> $GITHUB_STEP_SUMMARY
+          echo "## 📦 Image Built"                                       >> $GITHUB_STEP_SUMMARY
+          echo "| Key | Value |"                                          >> $GITHUB_STEP_SUMMARY
+          echo "|-----|-------|"                                           >> $GITHUB_STEP_SUMMARY
+          echo "| Tag    | \`${{ steps.meta.outputs.image_tag }}\` |"   >> $GITHUB_STEP_SUMMARY
+          echo "| Digest | \`${{ steps.push.outputs.digest }}\` |"      >> $GITHUB_STEP_SUMMARY
+          echo "| Jira   | ${{ steps.jira_create.outputs.jira_key }} |" >> $GITHUB_STEP_SUMMARY
 
   # ============================================================================
-  # JOB 3 – Deploy to DEV
+  # JOB 3 – Deploy to DEV  →  Jira: comment only (stays In Progress)
   # ============================================================================
   deploy-dev:
     name: Deploy → dev
@@ -343,7 +350,6 @@ jobs:
             --query taskDefinition \
             --output json > task-def-dev.json
 
-          # Inject APP_ENV and BUILD_SHA directly into the JSON
           jq '(.containerDefinitions[0].environment) |=
             (map(select(.name != "APP_ENV" and .name != "BUILD_SHA")) +
             [{"name":"APP_ENV","value":"dev"},
@@ -374,24 +380,28 @@ jobs:
       - name: Smoke test
         run: bash scripts/smoke-test.sh "${{ vars.DEV_URL }}"
 
-      - name: Update Jira → "In QA"
-        if: env.JIRA_KEY != ''
-        run: node scripts/jira-transition.js --key "${{ env.JIRA_KEY }}" --status "In QA" --env "dev"
+      - name: Jira → comment (stays In Progress)
         env:
           JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
           JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
-          JIRA_TRANSITION_DEV: ${{ vars.JIRA_TRANSITION_DEV }}
-          JIRA_TRANSITION_STAGING: ${{ vars.JIRA_TRANSITION_STAGING }}
-          JIRA_TRANSITION_PROD: ${{ vars.JIRA_TRANSITION_PROD }}
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          node scripts/jira-transition.js \
+            --action comment \
+            --key "${{ env.JIRA_KEY }}" \
+            --comment "✅ Deployed to DEV — Build #${{ github.run_number }} | SHA: ${SHORT_SHA}
+          URL: ${{ vars.DEV_URL }}
+          Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
       - name: Summary
         run: |
           echo "## ✅ Deployed to dev" >> $GITHUB_STEP_SUMMARY
           echo "URL: ${{ vars.DEV_URL }}" >> $GITHUB_STEP_SUMMARY
+          echo "Jira: ${{ env.JIRA_KEY }} — commented (In Progress)" >> $GITHUB_STEP_SUMMARY
 
   # ============================================================================
-  # JOB 4 – Deploy to STAGING (approval gate)
+  # JOB 4 – Deploy to STAGING (approval)  →  Jira: comment only (stays In Progress)
   # ============================================================================
   deploy-staging:
     name: Deploy → staging
@@ -441,7 +451,6 @@ jobs:
             --query taskDefinition \
             --output json > task-def-staging.json
 
-          # Inject APP_ENV and BUILD_SHA directly into the JSON
           jq '(.containerDefinitions[0].environment) |=
             (map(select(.name != "APP_ENV" and .name != "BUILD_SHA")) +
             [{"name":"APP_ENV","value":"staging"},
@@ -472,24 +481,28 @@ jobs:
       - name: Smoke test
         run: bash scripts/smoke-test.sh "${{ vars.STAGING_URL }}"
 
-      - name: Update Jira → "UAT"
-        if: env.JIRA_KEY != ''
-        run: node scripts/jira-transition.js --key "${{ env.JIRA_KEY }}" --status "UAT" --env "staging"
+      - name: Jira → comment (stays In Progress)
         env:
           JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
           JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
-          JIRA_TRANSITION_DEV: ${{ vars.JIRA_TRANSITION_DEV }}
-          JIRA_TRANSITION_STAGING: ${{ vars.JIRA_TRANSITION_STAGING }}
-          JIRA_TRANSITION_PROD: ${{ vars.JIRA_TRANSITION_PROD }}
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          node scripts/jira-transition.js \
+            --action comment \
+            --key "${{ env.JIRA_KEY }}" \
+            --comment "✅ Deployed to STAGING — Build #${{ github.run_number }} | SHA: ${SHORT_SHA}
+          URL: ${{ vars.STAGING_URL }}
+          Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
       - name: Summary
         run: |
           echo "## ✅ Deployed to staging" >> $GITHUB_STEP_SUMMARY
           echo "URL: ${{ vars.STAGING_URL }}" >> $GITHUB_STEP_SUMMARY
+          echo "Jira: ${{ env.JIRA_KEY }} — commented (In Progress)" >> $GITHUB_STEP_SUMMARY
 
   # ============================================================================
-  # JOB 5 – Deploy to PROD (approval gate)
+  # JOB 5 – Deploy to PROD (approval)  →  Jira: comment + transition to Done
   # ============================================================================
   deploy-prod:
     name: Deploy → prod
@@ -539,7 +552,6 @@ jobs:
             --query taskDefinition \
             --output json > task-def-prod.json
 
-          # Inject APP_ENV and BUILD_SHA directly into the JSON
           jq '(.containerDefinitions[0].environment) |=
             (map(select(.name != "APP_ENV" and .name != "BUILD_SHA")) +
             [{"name":"APP_ENV","value":"production"},
@@ -570,16 +582,24 @@ jobs:
       - name: Smoke test
         run: bash scripts/smoke-test.sh "${{ vars.PROD_URL }}"
 
-      - name: Update Jira → "Done"
-        if: env.JIRA_KEY != ''
-        run: node scripts/jira-transition.js --key "${{ env.JIRA_KEY }}" --status "Done" --env "prod"
+      - name: Jira → comment + transition to Done
         env:
           JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
           JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
-          JIRA_TRANSITION_DEV: ${{ vars.JIRA_TRANSITION_DEV }}
-          JIRA_TRANSITION_STAGING: ${{ vars.JIRA_TRANSITION_STAGING }}
-          JIRA_TRANSITION_PROD: ${{ vars.JIRA_TRANSITION_PROD }}
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          node scripts/jira-transition.js \
+            --action comment \
+            --key "${{ env.JIRA_KEY }}" \
+            --comment "🚀 Deployed to PRODUCTION — Build #${{ github.run_number }} | SHA: ${SHORT_SHA}
+          URL: ${{ vars.PROD_URL }}
+          Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          node scripts/jira-transition.js \
+            --action transition \
+            --key "${{ env.JIRA_KEY }}" \
+            --status "Done"
 
       - name: Tag image as prod-latest
         run: |
@@ -594,5 +614,6 @@ jobs:
 
       - name: Summary
         run: |
-          echo "## 🚀 Deployed to PRODUCTION" >> $GITHUB_STEP_SUMMARY
-          echo "URL: ${{ vars.PROD_URL }}"     >> $GITHUB_STEP_SUMMARY
+          echo "## 🚀 Deployed to PRODUCTION"                     >> $GITHUB_STEP_SUMMARY
+          echo "URL: ${{ vars.PROD_URL }}"                         >> $GITHUB_STEP_SUMMARY
+          echo "Jira: ${{ env.JIRA_KEY }} → Done"                  >> $GITHUB_STEP_SUMMARY
