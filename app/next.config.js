@@ -1,12 +1,10 @@
 /** @type {import('next').NextConfig} */
+
 const nextConfig = {
   output: 'standalone',
   reactStrictMode: true,
-
-  env: {
-    NEXT_PUBLIC_APP_ENV: process.env.APP_ENV || 'local',
-    NEXT_PUBLIC_BUILD_SHA: process.env.BUILD_SHA || 'dev',
-  },
+  // No basePath — middleware handles /dev and /staging rewrites
+  // APP_ENV and BUILD_SHA are read at runtime via process.env in server components
 };
 
 module.exports = nextConfig;

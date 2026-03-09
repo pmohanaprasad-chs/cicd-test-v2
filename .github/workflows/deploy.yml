@@ -201,9 +201,11 @@ jobs:
         run: |
           ALB="http://${{ steps.outputs.outputs.alb_dns }}"
           REPO="${{ github.repository }}"
+          ALB_DEV="${ALB}/dev"
+          ALB_STAGING="${ALB}/staging"
 
-          gh variable set "DEV_URL"     --body "$ALB" --env dev     --repo "$REPO"
-          gh variable set "STAGING_URL" --body "$ALB" --env staging --repo "$REPO"
+          gh variable set "DEV_URL"     --body "$ALB_DEV" --env dev     --repo "$REPO"
+          gh variable set "STAGING_URL" --body "$ALB_STAGING" --env staging --repo "$REPO"
           gh variable set "PROD_URL"    --body "$ALB" --env prod    --repo "$REPO"
 
           echo "✅ URLs synced: $ALB"
