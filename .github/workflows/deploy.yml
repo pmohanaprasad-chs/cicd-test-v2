@@ -3,11 +3,9 @@
 #
 # Flow:
 #   push to dev
-#     └─ provision-infra  (terraform: creates ECR/ECS/ALB if not exists)
-#         └─ build-and-push  (builds image, pushes to ECR)
-#             └─ deploy-dev  (auto deploy, smoke test, Jira → "In QA")
-#                 └─ deploy-staging  (approval gate)
-#                     └─ deploy-prod  (approval gate)
+#     └─ provision-infra → build-and-push → deploy-dev (auto)
+#         └─ deploy-staging (approval gate → auto merges dev→staging → deploys)
+#             └─ deploy-prod (approval gate → auto merges staging→main → deploys)
 # ============================================================================
 name: Deploy
 
@@ -197,18 +195,29 @@ jobs:
           echo "ALB: http://${{ steps.outputs.outputs.alb_dns }}" >> $GITHUB_STEP_SUMMARY
           echo "ECR: ${{ steps.outputs.outputs.ecr_url }}"        >> $GITHUB_STEP_SUMMARY
 
-      # - name: Sync ALB URLs to GitHub variables
-      #   env:
-      #     GH_TOKEN: ${{ secrets.GH_PAT }}
-      #   run: |
-      #     ALB="http://${{ steps.outputs.outputs.alb_dns }}"
-      #     REPO="${{ github.repository }}"
+      - name: Sync ALB URLs to GitHub variables
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          ALB="http://${{ steps.outputs.outputs.alb_dns }}"
+          REPO="${{ github.repository }}"
 
-      #     gh variable set "DEV_URL"     --body "$ALB" --env dev     --repo "$REPO"
-      #     gh variable set "STAGING_URL" --body "$ALB" --env staging --repo "$REPO"
-      #     gh variable set "PROD_URL"    --body "$ALB" --env prod    --repo "$REPO"
+          gh variable set "DEV_URL"     --body "$ALB" --env dev     --repo "$REPO"
+          gh variable set "STAGING_URL" --body "$ALB" --env staging --repo "$REPO"
+          gh variable set "PROD_URL"    --body "$ALB" --env prod    --repo "$REPO"
 
-      #     echo "✅ URLs synced: $ALB"
+          echo "✅ URLs synced: $ALB"
+
+      - name: Print ALB URL
+        run: |
+          ALB="http://${{ steps.outputs.outputs.alb_dns }}"
+          echo "## 🌐 ALB URL" >> $GITHUB_STEP_SUMMARY
+          echo "$ALB" >> $GITHUB_STEP_SUMMARY
+          echo ""
+          echo "If this is a new ALB, update these GitHub environment variables manually:"
+          echo "  DEV_URL     = $ALB"
+          echo "  STAGING_URL = $ALB"
+          echo "  PROD_URL    = $ALB"
 
   # ============================================================================
   # JOB 2 – Build & push Docker image to ECR
@@ -350,7 +359,6 @@ jobs:
           container-name: ${{ vars.ECS_CONTAINER_NAME }}
           image: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}@${{ env.IMAGE_DIGEST }}
           environment-variables: |
-            NEXT_PUBLIC_APP_ENV=dev
             APP_ENV=dev
             BUILD_SHA=${{ github.sha }}
 
@@ -393,7 +401,7 @@ jobs:
 
     permissions:
       id-token: write
-      contents: read
+      contents: write # needed to push branch merge
 
     env:
       IMAGE_DIGEST: ${{ needs.build-and-push.outputs.image_digest }}
@@ -402,6 +410,18 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history needed for merge
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge dev → staging branch
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout staging || git checkout -b staging
+          git merge origin/dev --no-edit -m "chore: promote dev → staging [skip ci]"
+          git push origin staging
+          echo "✅ dev merged into staging"
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -429,7 +449,6 @@ jobs:
           container-name: ${{ vars.ECS_CONTAINER_NAME }}
           image: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}@${{ env.IMAGE_DIGEST }}
           environment-variables: |
-            NEXT_PUBLIC_APP_ENV=staging
             APP_ENV=staging
             BUILD_SHA=${{ github.sha }}
 
@@ -472,7 +491,7 @@ jobs:
 
     permissions:
       id-token: write
-      contents: read
+      contents: write # needed to push branch merge
 
     env:
       IMAGE_DIGEST: ${{ needs.build-and-push.outputs.image_digest }}
@@ -481,6 +500,18 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history needed for merge
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge staging → main branch
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout main || git checkout -b main
+          git merge origin/staging --no-edit -m "chore: promote staging → main [skip ci]"
+          git push origin main
+          echo "✅ staging merged into main"
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -508,7 +539,6 @@ jobs:
           container-name: ${{ vars.ECS_CONTAINER_NAME }}
           image: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}@${{ env.IMAGE_DIGEST }}
           environment-variables: |
-            NEXT_PUBLIC_APP_ENV=production
             APP_ENV=production
             BUILD_SHA=${{ github.sha }}
 
