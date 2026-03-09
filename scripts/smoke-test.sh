@@ -27,8 +27,7 @@ check_url() {
     echo "[attempt ${attempt}/${MAX_RETRIES}] GET ${url}"
 
     HTTP_STATUS=$(curl -s -o /tmp/smoke_body.txt -w "%{http_code}" \
-      --max-time 10 --connect-timeout 5 \
-      --location \        # follow redirects
+      --max-time 10 --connect-timeout 5 --location \
       "${url}" || echo "000")
 
     if [[ "${HTTP_STATUS}" == "200" ]]; then
