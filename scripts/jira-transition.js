@@ -77,7 +77,10 @@ function jiraRequest(method, path, body) {
 // ── actions ──────────────────────────────────────────────────────────────────
 
 async function createIssue({ project, summary, description }) {
-  console.log(`Creating Jira task in project ${project}: "${summary}"`);
+  // All logs go to stderr — stdout is reserved for the clean issue key only
+  process.stderr.write(
+    `Creating Jira task in project ${project}: "${summary}"\n`,
+  );
   const body = {
     fields: {
       project: { key: project },
@@ -97,8 +100,8 @@ async function createIssue({ project, summary, description }) {
   };
 
   const result = await jiraRequest('POST', '/rest/api/3/issue', body);
-  console.log(`✅ Created issue: ${result.key}`);
-  // Print key to stdout so the workflow can capture it
+  process.stderr.write(`✅ Created issue: ${result.key}\n`);
+  // Only the key goes to stdout so $() capture is clean
   process.stdout.write(result.key);
   return result.key;
 }

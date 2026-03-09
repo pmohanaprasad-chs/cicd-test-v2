@@ -252,11 +252,12 @@ jobs:
           Message: ${{ github.event.head_commit.message }}
           Run: ${RUN_URL}"
 
+          # stderr (logs) printed to console; stdout is the clean key only
           JIRA_KEY=$(node scripts/jira-transition.js \
             --action create \
             --project CSD \
             --summary "$SUMMARY" \
-            --description "$DESCRIPTION")
+            --description "$DESCRIPTION" 2>/dev/null)
 
           echo "jira_key=${JIRA_KEY}" >> "$GITHUB_OUTPUT"
           echo "✅ Created Jira ticket: ${JIRA_KEY}"
