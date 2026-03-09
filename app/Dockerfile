@@ -23,11 +23,11 @@ RUN corepack enable && corepack prepare pnpm@latest --activate
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
-# Build-time args injected by GitHub Actions
-ARG APP_ENV=production
+# Build-time args
 ARG BUILD_SHA=unknown
-ENV APP_ENV=${APP_ENV}
 ENV BUILD_SHA=${BUILD_SHA}
+# APP_ENV is NOT set at build time — it is injected per-environment
+# via ECS task definition at runtime
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV NODE_ENV=production
 
