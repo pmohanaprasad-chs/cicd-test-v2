@@ -5,6 +5,8 @@ export const metadata: Metadata = {
   description: 'Enterprise CI/CD reference implementation',
 };
 
+export const dynamic = 'force-dynamic';
+
 export default function HomePage() {
   const appEnv = process.env.APP_ENV ?? 'local';
   const buildSha = process.env.BUILD_SHA ?? 'unknown';
