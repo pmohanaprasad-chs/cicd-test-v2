@@ -195,6 +195,63 @@ jobs:
           else exit 1
           fi
 
+      # ── Clean up unused VPCs to avoid hitting the 5-VPC account limit ────────
+      - name: Clean up unused VPCs
+        run: |
+          PROJECT="${{ vars.PROJECT_NAME }}"
+          VPC_COUNT=$(aws ec2 describe-vpcs --query 'length(Vpcs)' --output text)
+          echo "Current VPC count: $VPC_COUNT"
+
+          if [[ "$VPC_COUNT" -lt 5 ]]; then
+            echo "✅ VPC count is fine ($VPC_COUNT/5)"
+            exit 0
+          fi
+
+          echo "⚠️  VPC limit approaching — cleaning up unused VPCs"
+
+          # Get all VPCs except default and our project VPC
+          UNUSED_VPCS=$(aws ec2 describe-vpcs             --query "Vpcs[?IsDefault==\`false\` && Tags[?Key=='Name' && Value!='${PROJECT}-vpc']].VpcId"             --output text 2>/dev/null || echo "")
+
+          for VPC_ID in $UNUSED_VPCS; do
+            echo "Checking VPC: $VPC_ID"
+
+            # Skip if it has running instances
+            INSTANCES=$(aws ec2 describe-instances               --filters "Name=vpc-id,Values=$VPC_ID" "Name=instance-state-name,Values=running,stopped"               --query 'length(Reservations)' --output text 2>/dev/null || echo "0")
+            if [[ "$INSTANCES" != "0" ]]; then
+              echo "  ⏭️  Skipping — has $INSTANCES instance(s)"
+              continue
+            fi
+
+            # Delete dependencies then VPC
+            echo "  🗑️  Deleting unused VPC: $VPC_ID"
+
+            # Delete subnets
+            for SUBNET in $(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID"               --query 'Subnets[*].SubnetId' --output text 2>/dev/null); do
+              aws ec2 delete-subnet --subnet-id "$SUBNET" 2>/dev/null || true
+            done
+
+            # Detach and delete internet gateways
+            for IGW in $(aws ec2 describe-internet-gateways               --filters "Name=attachment.vpc-id,Values=$VPC_ID"               --query 'InternetGateways[*].InternetGatewayId' --output text 2>/dev/null); do
+              aws ec2 detach-internet-gateway --internet-gateway-id "$IGW" --vpc-id "$VPC_ID" 2>/dev/null || true
+              aws ec2 delete-internet-gateway --internet-gateway-id "$IGW" 2>/dev/null || true
+            done
+
+            # Delete non-main route tables
+            for RT in $(aws ec2 describe-route-tables               --filters "Name=vpc-id,Values=$VPC_ID"               --query 'RouteTables[?Associations[?Main!=`true`] || !Associations].RouteTableId'               --output text 2>/dev/null); do
+              aws ec2 delete-route-table --route-table-id "$RT" 2>/dev/null || true
+            done
+
+            # Delete security groups (non-default)
+            for SG in $(aws ec2 describe-security-groups               --filters "Name=vpc-id,Values=$VPC_ID"               --query 'SecurityGroups[?GroupName!=`default`].GroupId'               --output text 2>/dev/null); do
+              aws ec2 delete-security-group --group-id "$SG" 2>/dev/null || true
+            done
+
+            aws ec2 delete-vpc --vpc-id "$VPC_ID" 2>/dev/null &&               echo "  ✅ Deleted VPC: $VPC_ID" ||               echo "  ⚠️  Could not delete VPC: $VPC_ID (may have dependencies)"
+          done
+
+          NEW_COUNT=$(aws ec2 describe-vpcs --query 'length(Vpcs)' --output text)
+          echo "VPC count after cleanup: $NEW_COUNT/5"
+
       - name: Terraform Apply
         if: steps.plan.outputs.result == 'changes'
         working-directory: terraform
