@@ -180,7 +180,9 @@ jobs:
         env:
           AWS_REGION: ${{ env.AWS_REGION }}
           PROJECT_NAME: ${{ vars.PROJECT_NAME }}
-        run: bash ../scripts/tf-import-ci.sh
+        run: |
+          set -x
+          bash ../scripts/tf-import-ci.sh
 
       - name: Terraform Plan
         id: plan
@@ -196,61 +198,108 @@ jobs:
           fi
 
       # ── Clean up unused VPCs to avoid hitting the 5-VPC account limit ────────
-      - name: Clean up unused VPCs
+      - name: Clean up unused VPCs and orphaned resources
         run: |
           PROJECT="${{ vars.PROJECT_NAME }}"
-          VPC_COUNT=$(aws ec2 describe-vpcs --query 'length(Vpcs)' --output text)
-          echo "Current VPC count: $VPC_COUNT"
 
-          if [[ "$VPC_COUNT" -lt 5 ]]; then
-            echo "✅ VPC count is fine ($VPC_COUNT/5)"
-            exit 0
-          fi
+          delete_vpc() {
+            local VPC_ID="$1"
+            echo "  🗑️  Cleaning VPC: $VPC_ID"
 
-          echo "⚠️  VPC limit approaching — cleaning up unused VPCs"
+            # Stop ECS services using this VPC
+            for SVC in dev staging prod; do
+              aws ecs update-service --cluster "${PROJECT}-cluster"                 --service "${PROJECT}-${SVC}" --desired-count 0 2>/dev/null || true
+              aws ecs delete-service --cluster "${PROJECT}-cluster"                 --service "${PROJECT}-${SVC}" --force 2>/dev/null || true
+            done
+            aws ecs delete-cluster --cluster "${PROJECT}-cluster" 2>/dev/null || true
 
-          # Get all VPCs except default and our project VPC
-          UNUSED_VPCS=$(aws ec2 describe-vpcs             --query "Vpcs[?IsDefault==\`false\` && Tags[?Key=='Name' && Value!='${PROJECT}-vpc']].VpcId"             --output text 2>/dev/null || echo "")
+            # Delete ALBs in this VPC
+            for ELB in $(aws elbv2 describe-load-balancers               --query "LoadBalancers[?VpcId=='$VPC_ID'].LoadBalancerArn"               --output text 2>/dev/null); do
+              aws elbv2 delete-load-balancer --load-balancer-arn "$ELB" 2>/dev/null || true
+              echo "    Waiting for ALB deletion..."
+              sleep 15
+            done
 
-          for VPC_ID in $UNUSED_VPCS; do
-            echo "Checking VPC: $VPC_ID"
+            # Delete NAT gateways and wait
+            for NAT in $(aws ec2 describe-nat-gateways               --filter "Name=vpc-id,Values=$VPC_ID" "Name=state,Values=available,pending"               --query 'NatGateways[*].NatGatewayId' --output text 2>/dev/null); do
+              aws ec2 delete-nat-gateway --nat-gateway-id "$NAT" 2>/dev/null || true
+            done
+            for i in $(seq 1 18); do
+              PENDING=$(aws ec2 describe-nat-gateways                 --filter "Name=vpc-id,Values=$VPC_ID" "Name=state,Values=available,pending,deleting"                 --query 'length(NatGateways)' --output text 2>/dev/null || echo "0")
+              [[ "$PENDING" == "0" || "$PENDING" == "None" ]] && break
+              echo "    Waiting for NAT gateway deletion ($PENDING remaining)..."
+              sleep 10
+            done
 
-            # Skip if it has running instances
-            INSTANCES=$(aws ec2 describe-instances               --filters "Name=vpc-id,Values=$VPC_ID" "Name=instance-state-name,Values=running,stopped"               --query 'length(Reservations)' --output text 2>/dev/null || echo "0")
-            if [[ "$INSTANCES" != "0" ]]; then
-              echo "  ⏭️  Skipping — has $INSTANCES instance(s)"
-              continue
-            fi
-
-            # Delete dependencies then VPC
-            echo "  🗑️  Deleting unused VPC: $VPC_ID"
+            # Release EIPs associated with this VPC's NAT gateways
+            for EIP in $(aws ec2 describe-addresses               --filters "Name=tag:Name,Values=${PROJECT}-*"               --query 'Addresses[?AssociationId==null].AllocationId'               --output text 2>/dev/null); do
+              aws ec2 release-address --allocation-id "$EIP" 2>/dev/null || true
+            done
 
             # Delete subnets
-            for SUBNET in $(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID"               --query 'Subnets[*].SubnetId' --output text 2>/dev/null); do
+            for SUBNET in $(aws ec2 describe-subnets               --filters "Name=vpc-id,Values=$VPC_ID"               --query 'Subnets[*].SubnetId' --output text 2>/dev/null); do
               aws ec2 delete-subnet --subnet-id "$SUBNET" 2>/dev/null || true
             done
 
-            # Detach and delete internet gateways
+            # Detach + delete IGWs
             for IGW in $(aws ec2 describe-internet-gateways               --filters "Name=attachment.vpc-id,Values=$VPC_ID"               --query 'InternetGateways[*].InternetGatewayId' --output text 2>/dev/null); do
               aws ec2 detach-internet-gateway --internet-gateway-id "$IGW" --vpc-id "$VPC_ID" 2>/dev/null || true
               aws ec2 delete-internet-gateway --internet-gateway-id "$IGW" 2>/dev/null || true
             done
 
             # Delete non-main route tables
-            for RT in $(aws ec2 describe-route-tables               --filters "Name=vpc-id,Values=$VPC_ID"               --query 'RouteTables[?Associations[?Main!=`true`] || !Associations].RouteTableId'               --output text 2>/dev/null); do
+            for RT in $(aws ec2 describe-route-tables               --filters "Name=vpc-id,Values=$VPC_ID"               --query 'RouteTables[?!Associations[?Main==`true`]].RouteTableId'               --output text 2>/dev/null); do
               aws ec2 delete-route-table --route-table-id "$RT" 2>/dev/null || true
             done
 
-            # Delete security groups (non-default)
+            # Delete non-default security groups
             for SG in $(aws ec2 describe-security-groups               --filters "Name=vpc-id,Values=$VPC_ID"               --query 'SecurityGroups[?GroupName!=`default`].GroupId'               --output text 2>/dev/null); do
               aws ec2 delete-security-group --group-id "$SG" 2>/dev/null || true
             done
 
-            aws ec2 delete-vpc --vpc-id "$VPC_ID" 2>/dev/null &&               echo "  ✅ Deleted VPC: $VPC_ID" ||               echo "  ⚠️  Could not delete VPC: $VPC_ID (may have dependencies)"
+            aws ec2 delete-vpc --vpc-id "$VPC_ID" 2>/dev/null               && echo "  ✅ Deleted VPC: $VPC_ID"               || echo "  ⚠️  Could not delete VPC: $VPC_ID"
+          }
+
+          VPC_COUNT=$(aws ec2 describe-vpcs --query 'length(Vpcs)' --output text)
+          echo "Current VPC count: $VPC_COUNT/5"
+
+          if [[ "$VPC_COUNT" -lt 5 ]]; then
+            echo "✅ VPC count OK"
+            exit 0
+          fi
+
+          echo "⚠️  At VPC limit — cleaning up"
+          echo "All VPCs:"
+          aws ec2 describe-vpcs             --query 'Vpcs[*].{ID:VpcId,Default:IsDefault,Name:Tags[?Key==`Name`].Value|[0]}'             --output table
+
+          # Priority 1: delete our own leftover project VPC (terraform will recreate it)
+          PROJECT_VPC=$(aws ec2 describe-vpcs             --filters "Name=tag:Name,Values=${PROJECT}-vpc"             --query 'Vpcs[0].VpcId' --output text 2>/dev/null || echo "")
+          if [[ -n "$PROJECT_VPC" && "$PROJECT_VPC" != "None" ]]; then
+            echo "Removing leftover project VPC: $PROJECT_VPC"
+            delete_vpc "$PROJECT_VPC"
+          fi
+
+          VPC_COUNT=$(aws ec2 describe-vpcs --query 'length(Vpcs)' --output text)
+          echo "VPC count after project cleanup: $VPC_COUNT/5"
+          [[ "$VPC_COUNT" -lt 5 ]] && exit 0
+
+          # Priority 2: delete other non-default VPCs with no running instances
+          for VPC_ID in $(aws ec2 describe-vpcs             --query 'Vpcs[?IsDefault==`false`].VpcId' --output text 2>/dev/null); do
+            INSTANCES=$(aws ec2 describe-instances               --filters "Name=vpc-id,Values=$VPC_ID"                         "Name=instance-state-name,Values=running,stopped,pending"               --query 'length(Reservations)' --output text 2>/dev/null || echo "0")
+            if [[ "$INSTANCES" == "0" ]]; then
+              delete_vpc "$VPC_ID"
+              VPC_COUNT=$(aws ec2 describe-vpcs --query 'length(Vpcs)' --output text)
+              [[ "$VPC_COUNT" -lt 5 ]] && break
+            fi
           done
 
-          NEW_COUNT=$(aws ec2 describe-vpcs --query 'length(Vpcs)' --output text)
-          echo "VPC count after cleanup: $NEW_COUNT/5"
+          FINAL=$(aws ec2 describe-vpcs --query 'length(Vpcs)' --output text)
+          echo "Final VPC count: $FINAL/5"
+          if [[ "$FINAL" -ge 5 ]]; then
+            echo "❌ Still at VPC limit — cannot create new VPC"
+            exit 1
+          fi
+          echo "✅ VPC slot available"
 
       - name: Terraform Apply
         if: steps.plan.outputs.result == 'changes'
