@@ -11,14 +11,16 @@
 #   - ALB + target groups + listeners
 #   - ECR repository (and all images inside)
 #   - VPC + subnets + NAT gateway + route tables
-#   - IAM roles + policies
 #   - CloudWatch log groups
 #   - Security groups
+#   - IAM roles + policies (EXCEPT github-actions role — needed for OIDC)
 #
-# What is NOT deleted (kept for safety):
-#   - S3 state bucket
-#   - DynamoDB lock table
-#   - OIDC provider (shared AWS account resource)
+# What is NEVER deleted (required to run this workflow):
+#   - OIDC provider  ← deleting this breaks ALL future workflow runs
+#   - IAM github-actions role + policy ← deleting this breaks OIDC auth
+#
+# What is optionally deleted:
+#   - S3 state bucket + DynamoDB lock table (checkbox)
 # ============================================================================
 name: Destroy Infrastructure
 
@@ -54,8 +56,7 @@ jobs:
       - name: Confirm destroy
         if: inputs.confirm != 'destroy'
         run: |
-          echo "❌ Confirmation failed."
-          echo "You typed: '${{ inputs.confirm }}'"
+          echo "❌ Confirmation failed. You typed: '${{ inputs.confirm }}'"
           echo "You must type exactly: destroy"
           exit 1
 
@@ -68,24 +69,48 @@ jobs:
           role-to-assume: ${{ vars.IAM_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: tf-destroy-${{ github.run_id }}
-          role-duration-seconds: 7200 # 2 hours — destroy can take a while
+          role-duration-seconds: 7200
 
-      # ── Scale down ECS services first (speeds up destroy) ───────────────────
-      - name: Scale down ECS services
+      # ── Scale down ECS services + wait for tasks to fully drain ─────────────
+      - name: Scale down ECS services and wait for drain
         run: |
           CLUSTER="${{ vars.PROJECT_NAME }}-cluster"
+
+          # Check cluster exists first
+          STATUS=$(aws ecs describe-clusters --clusters "$CLUSTER" \
+            --query 'clusters[0].status' --output text 2>/dev/null || echo "MISSING")
+
+          if [[ "$STATUS" != "ACTIVE" ]]; then
+            echo "⏭️  Cluster $CLUSTER not found or not active — skipping scale down"
+            exit 0
+          fi
+
           for ENV in dev staging prod; do
             SERVICE="${{ vars.PROJECT_NAME }}-${ENV}"
             echo "Scaling down $SERVICE..."
             aws ecs update-service \
               --cluster "$CLUSTER" \
               --service "$SERVICE" \
-              --desired-count 0 2>/dev/null && echo "✅ $SERVICE scaled to 0" || echo "⏭️  $SERVICE not found"
+              --desired-count 0 2>/dev/null \
+              && echo "✅ $SERVICE scaled to 0" \
+              || echo "⏭️  $SERVICE not found"
           done
-          echo "Waiting 15s for tasks to stop..."
-          sleep 15
 
-      # ── Terraform destroy ────────────────────────────────────────────────────
+          echo "Waiting for all tasks to stop (up to 3 mins)..."
+          for i in $(seq 1 18); do
+            RUNNING=$(aws ecs list-tasks --cluster "$CLUSTER" \
+              --query 'length(taskArns)' --output text 2>/dev/null || echo "0")
+            echo "  Tasks still running: $RUNNING"
+            if [[ "$RUNNING" == "0" ]]; then
+              echo "✅ All tasks stopped"
+              break
+            fi
+            sleep 10
+          done
+
+      # ── Remove OIDC provider + IAM role from Terraform state ────────────────
+      # These must NOT be destroyed — they are required for OIDC auth.
+      # We remove them from state so terraform destroy ignores them.
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
@@ -112,6 +137,28 @@ jobs:
             -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
             -backend-config="encrypt=true"
 
+      - name: Remove OIDC + IAM role from Terraform state
+        working-directory: terraform
+        run: |
+          # Remove from state only — does NOT delete from AWS
+          # This prevents terraform destroy from touching these resources
+          terraform state rm module.iam.aws_iam_openid_connect_provider.github 2>/dev/null \
+            && echo "✅ Removed OIDC provider from state" \
+            || echo "⏭️  OIDC provider not in state"
+
+          terraform state rm module.iam.aws_iam_role.github_actions 2>/dev/null \
+            && echo "✅ Removed IAM role from state" \
+            || echo "⏭️  IAM role not in state"
+
+          terraform state rm module.iam.aws_iam_policy.github_actions 2>/dev/null \
+            && echo "✅ Removed IAM policy from state" \
+            || echo "⏭️  IAM policy not in state"
+
+          terraform state rm module.iam.aws_iam_role_policy_attachment.github_actions 2>/dev/null \
+            && echo "✅ Removed IAM policy attachment from state" \
+            || echo "⏭️  IAM policy attachment not in state"
+
+      # ── Terraform destroy ────────────────────────────────────────────────────
       - name: Terraform Destroy
         working-directory: terraform
         run: |
@@ -128,30 +175,48 @@ jobs:
           TABLE="${{ vars.TF_LOCK_TABLE }}"
 
           echo "Deleting all objects in S3 bucket..."
-          aws s3 rm s3://${BUCKET} --recursive
+          aws s3 rm "s3://${BUCKET}" --recursive 2>/dev/null || true
 
-          echo "Deleting S3 bucket versions..."
-          aws s3api delete-objects \
+          echo "Deleting versioned objects..."
+          VERSIONS=$(aws s3api list-object-versions \
             --bucket "$BUCKET" \
-            --delete "$(aws s3api list-object-versions \
-              --bucket "$BUCKET" \
-              --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' \
-              --output json)" 2>/dev/null || true
+            --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' \
+            --output json 2>/dev/null || echo '{"Objects":null}')
 
-          aws s3api delete-bucket --bucket "$BUCKET" && \
-            echo "✅ Deleted S3 bucket: $BUCKET" || true
+          if echo "$VERSIONS" | jq -e '.Objects != null' > /dev/null 2>&1; then
+            aws s3api delete-objects --bucket "$BUCKET" --delete "$VERSIONS" 2>/dev/null || true
+          fi
 
-          aws dynamodb delete-table --table-name "$TABLE" && \
-            echo "✅ Deleted DynamoDB table: $TABLE" || true
+          echo "Deleting delete markers..."
+          MARKERS=$(aws s3api list-object-versions \
+            --bucket "$BUCKET" \
+            --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' \
+            --output json 2>/dev/null || echo '{"Objects":null}')
+
+          if echo "$MARKERS" | jq -e '.Objects != null' > /dev/null 2>&1; then
+            aws s3api delete-objects --bucket "$BUCKET" --delete "$MARKERS" 2>/dev/null || true
+          fi
+
+          aws s3api delete-bucket --bucket "$BUCKET" 2>/dev/null \
+            && echo "✅ Deleted S3 bucket: $BUCKET" || echo "⏭️  S3 bucket not found"
+
+          aws dynamodb delete-table --table-name "$TABLE" 2>/dev/null \
+            && echo "✅ Deleted DynamoDB table: $TABLE" || echo "⏭️  DynamoDB table not found"
 
       - name: Summary
         if: always()
         run: |
-          echo "## 💥 Infrastructure Destroyed" >> $GITHUB_STEP_SUMMARY
-          echo "Triggered by: ${{ github.actor }}"    >> $GITHUB_STEP_SUMMARY
-          echo "Time: $(date -u)"                     >> $GITHUB_STEP_SUMMARY
+          echo "## 💥 Infrastructure Destroyed"              >> $GITHUB_STEP_SUMMARY
+          echo "Triggered by: ${{ github.actor }}"           >> $GITHUB_STEP_SUMMARY
+          echo "Time: $(date -u)"                            >> $GITHUB_STEP_SUMMARY
+          echo ""                                            >> $GITHUB_STEP_SUMMARY
+          echo "### ✅ Always kept (required for OIDC auth)" >> $GITHUB_STEP_SUMMARY
+          echo "- OIDC provider: token.actions.githubusercontent.com" >> $GITHUB_STEP_SUMMARY
+          echo "- IAM role: ${{ vars.PROJECT_NAME }}-github-actions"  >> $GITHUB_STEP_SUMMARY
+          echo ""                                            >> $GITHUB_STEP_SUMMARY
           if [[ "${{ inputs.delete_state_backend }}" == "true" ]]; then
-            echo "State backend: **deleted**"         >> $GITHUB_STEP_SUMMARY
+            echo "### 🗑️ State backend deleted"             >> $GITHUB_STEP_SUMMARY
           else
-            echo "State backend: kept (S3 + DynamoDB still exist)" >> $GITHUB_STEP_SUMMARY
+            echo "### 💾 State backend kept"                >> $GITHUB_STEP_SUMMARY
+            echo "S3 + DynamoDB still exist for next run"   >> $GITHUB_STEP_SUMMARY
           fi
