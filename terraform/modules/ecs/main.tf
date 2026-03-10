@@ -237,7 +237,7 @@ resource "aws_ecs_task_definition" "env" {
       }
 
       healthCheck = {
-        command     = ["CMD-SHELL", "wget -qO- http://localhost:80/ || exit 1"]
+        command     = ["CMD-SHELL", "wget -qO- http://localhost:3000/health.json || exit 1"]
         interval    = 15
         timeout     = 5
         retries     = 3
