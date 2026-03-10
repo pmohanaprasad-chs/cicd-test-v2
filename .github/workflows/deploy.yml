@@ -343,7 +343,6 @@ jobs:
           push: true
           tags: |
             ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.image_tag }}
-            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:dev-latest
           build-args: |
             BUILD_SHA=${{ github.sha }}
           cache-from: type=gha
@@ -649,17 +648,6 @@ jobs:
             --action transition \
             --key "${{ env.JIRA_KEY }}" \
             --status "Done"
-
-      - name: Tag image as prod-latest
-        run: |
-          MANIFEST=$(aws ecr batch-get-image \
-            --repository-name ${{ env.ECR_REPOSITORY }} \
-            --image-ids imageDigest=${{ env.IMAGE_DIGEST }} \
-            --query 'images[0].imageManifest' --output text)
-          aws ecr put-image \
-            --repository-name ${{ env.ECR_REPOSITORY }} \
-            --image-tag prod-latest \
-            --image-manifest "$MANIFEST" || true
 
       - name: Summary
         run: |
