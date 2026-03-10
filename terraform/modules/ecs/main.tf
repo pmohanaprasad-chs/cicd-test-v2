@@ -137,6 +137,8 @@ resource "aws_lb_target_group" "env" {
   vpc_id      = var.vpc_id
   target_type = "instance"
 
+  deregistration_delay = 30
+
   health_check {
     path                = "/health.json"
     healthy_threshold   = 2

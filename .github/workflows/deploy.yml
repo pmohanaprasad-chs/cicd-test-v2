@@ -580,7 +580,7 @@ jobs:
           service: ${{ vars.ECS_SERVICE_DEV }}
           cluster: ${{ env.ECS_CLUSTER }}
           wait-for-service-stability: true
-          wait-for-minutes: 10
+          wait-for-minutes: 20
 
       - name: Smoke test
         run: bash scripts/smoke-test.sh "${{ vars.DEV_URL }}"
@@ -681,7 +681,7 @@ jobs:
           service: ${{ vars.ECS_SERVICE_STAGING }}
           cluster: ${{ env.ECS_CLUSTER }}
           wait-for-service-stability: true
-          wait-for-minutes: 10
+          wait-for-minutes: 20
 
       - name: Smoke test
         run: bash scripts/smoke-test.sh "${{ vars.STAGING_URL }}"
