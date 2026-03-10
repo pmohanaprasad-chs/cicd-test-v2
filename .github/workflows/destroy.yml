@@ -127,6 +127,57 @@ jobs:
           github_repo  = "${{ vars.TF_GITHUB_REPO }}"
           EOF
 
+      # ── Fix corrupted state checksum (from previous failed destroy) ──────────
+      # When a previous run fails mid-destroy, DynamoDB holds a stale checksum
+      # that no longer matches S3. Clear it so terraform init can proceed.
+      - name: Fix state checksum if corrupted
+        run: |
+          BUCKET="${{ vars.TF_STATE_BUCKET }}"
+          TABLE="${{ vars.TF_LOCK_TABLE }}"
+          KEY="cicd-demo/terraform.tfstate"
+
+          TABLE_EXISTS=$(aws dynamodb list-tables --output text \
+            | tr '\t' '\n' | grep -x "$TABLE" || true)
+
+          if [[ -z "$TABLE_EXISTS" ]]; then
+            echo "⏭️  DynamoDB table not found — skipping checksum fix"
+            exit 0
+          fi
+
+          # Clear stale MD5 checksum
+          LOCK_KEY="${BUCKET}/${KEY}-md5"
+          ITEM=$(aws dynamodb get-item \
+            --table-name "$TABLE" \
+            --key "{\"LockID\": {\"S\": \"${LOCK_KEY}\"}}" \
+            --output json 2>/dev/null || echo "{}")
+
+          if echo "$ITEM" | jq -e '.Item' > /dev/null 2>&1; then
+            echo "🔧 Stale checksum found — removing"
+            aws dynamodb delete-item \
+              --table-name "$TABLE" \
+              --key "{\"LockID\": {\"S\": \"${LOCK_KEY}\"}}"
+            echo "✅ Checksum cleared"
+          else
+            echo "✅ No stale checksum"
+          fi
+
+          # Release any stuck state lock
+          LOCK_KEY2="${BUCKET}/${KEY}"
+          LOCK=$(aws dynamodb get-item \
+            --table-name "$TABLE" \
+            --key "{\"LockID\": {\"S\": \"${LOCK_KEY2}\"}}" \
+            --output json 2>/dev/null || echo "{}")
+
+          if echo "$LOCK" | jq -e '.Item' > /dev/null 2>&1; then
+            echo "🔧 Stuck state lock found — releasing"
+            aws dynamodb delete-item \
+              --table-name "$TABLE" \
+              --key "{\"LockID\": {\"S\": \"${LOCK_KEY2}\"}}"
+            echo "✅ Lock released"
+          else
+            echo "✅ No stuck lock"
+          fi
+
       - name: Terraform Init
         working-directory: terraform
         run: |
