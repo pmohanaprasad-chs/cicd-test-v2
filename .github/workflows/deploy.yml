@@ -65,6 +65,131 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: tf-infra-${{ github.run_id }}
 
+      # ── Clean up unused VPCs to avoid hitting the 5-VPC account limit ────────
+      - name: Clean up all orphaned cicd-demo resources
+        run: |
+          PROJECT="${{ vars.PROJECT_NAME }}"
+
+          echo "=== Cleaning up all orphaned ${PROJECT} resources ==="
+
+          # ── Helper: delete a VPC and all its dependencies ─────────────────
+          delete_vpc() {
+            local VPC_ID="$1"
+            echo "Deleting VPC: $VPC_ID"
+
+            # NAT gateways first (longest to delete)
+            for NAT in $(aws ec2 describe-nat-gateways               --filter "Name=vpc-id,Values=$VPC_ID" "Name=state,Values=available,pending"               --query 'NatGateways[*].NatGatewayId' --output text 2>/dev/null); do
+              aws ec2 delete-nat-gateway --nat-gateway-id "$NAT" 2>/dev/null &&                 echo "  Deleting NAT: $NAT" || true
+            done
+
+            # Wait for NAT gateways to finish
+            for i in $(seq 1 24); do
+              PENDING=$(aws ec2 describe-nat-gateways                 --filter "Name=vpc-id,Values=$VPC_ID"                          "Name=state,Values=available,pending,deleting"                 --query 'length(NatGateways)' --output text 2>/dev/null || echo "0")
+              [[ "$PENDING" == "0" || "$PENDING" == "None" ]] && break
+              echo "  Waiting for NAT ($PENDING remaining)..."
+              sleep 10
+            done
+
+            # Network interfaces — wait for them to detach/delete
+            for i in $(seq 1 12); do
+              ENI_COUNT=$(aws ec2 describe-network-interfaces                 --filters "Name=vpc-id,Values=$VPC_ID"                           "Name=status,Values=in-use"                 --query 'length(NetworkInterfaces)' --output text 2>/dev/null || echo "0")
+              [[ "$ENI_COUNT" == "0" || "$ENI_COUNT" == "None" ]] && break
+              echo "  Waiting for $ENI_COUNT ENI(s) to detach..."
+              sleep 10
+            done
+
+            # Delete remaining ENIs explicitly
+            for ENI in $(aws ec2 describe-network-interfaces               --filters "Name=vpc-id,Values=$VPC_ID"               --query 'NetworkInterfaces[?Status!=`in-use`].NetworkInterfaceId'               --output text 2>/dev/null); do
+              aws ec2 delete-network-interface --network-interface-id "$ENI" 2>/dev/null || true
+            done
+
+            # Subnets
+            for SUBNET in $(aws ec2 describe-subnets               --filters "Name=vpc-id,Values=$VPC_ID"               --query 'Subnets[*].SubnetId' --output text 2>/dev/null); do
+              aws ec2 delete-subnet --subnet-id "$SUBNET" 2>/dev/null || true
+            done
+
+            # IGWs
+            for IGW in $(aws ec2 describe-internet-gateways               --filters "Name=attachment.vpc-id,Values=$VPC_ID"               --query 'InternetGateways[*].InternetGatewayId' --output text 2>/dev/null); do
+              aws ec2 detach-internet-gateway --internet-gateway-id "$IGW"                 --vpc-id "$VPC_ID" 2>/dev/null || true
+              aws ec2 delete-internet-gateway --internet-gateway-id "$IGW" 2>/dev/null || true
+            done
+
+            # Route tables (non-main)
+            for RT in $(aws ec2 describe-route-tables               --filters "Name=vpc-id,Values=$VPC_ID"               --query 'RouteTables[?!Associations[?Main==`true`]].RouteTableId'               --output text 2>/dev/null); do
+              aws ec2 delete-route-table --route-table-id "$RT" 2>/dev/null || true
+            done
+
+            # Security groups (non-default) — revoke rules first to break dependencies
+            for SG in $(aws ec2 describe-security-groups               --filters "Name=vpc-id,Values=$VPC_ID"               --query 'SecurityGroups[?GroupName!=`default`].GroupId'               --output text 2>/dev/null); do
+              # Revoke all ingress and egress rules first
+              aws ec2 revoke-security-group-ingress --group-id "$SG"                 --ip-permissions "$(aws ec2 describe-security-groups                   --group-ids "$SG"                   --query 'SecurityGroups[0].IpPermissions'                   --output json 2>/dev/null)" 2>/dev/null || true
+              aws ec2 revoke-security-group-egress --group-id "$SG"                 --ip-permissions "$(aws ec2 describe-security-groups                   --group-ids "$SG"                   --query 'SecurityGroups[0].IpPermissionsEgress'                   --output json 2>/dev/null)" 2>/dev/null || true
+              aws ec2 delete-security-group --group-id "$SG" 2>/dev/null || true
+            done
+
+            aws ec2 delete-vpc --vpc-id "$VPC_ID" 2>/dev/null               && echo "  ✅ Deleted VPC $VPC_ID"               || echo "  ⚠️  Could not delete VPC $VPC_ID — may need another pass"
+          }
+
+          # ── Step 1: ECS ───────────────────────────────────────────────────
+          echo "--- ECS ---"
+          for SVC in dev staging prod; do
+            aws ecs update-service --cluster "${PROJECT}-cluster"               --service "${PROJECT}-${SVC}" --desired-count 0 2>/dev/null || true
+            aws ecs delete-service --cluster "${PROJECT}-cluster"               --service "${PROJECT}-${SVC}" --force 2>/dev/null               && echo "Deleted ECS service ${SVC}" || true
+          done
+          aws ecs put-cluster-capacity-providers             --cluster "${PROJECT}-cluster"             --capacity-providers []             --default-capacity-provider-strategy [] 2>/dev/null || true
+          aws ecs delete-cluster --cluster "${PROJECT}-cluster" 2>/dev/null             && echo "Deleted ECS cluster" || true
+
+          # ── Step 2: ASG — force delete and wait for instances to terminate ─
+          echo "--- ASG ---"
+          aws autoscaling delete-auto-scaling-group             --auto-scaling-group-name "${PROJECT}-ecs-asg"             --force-delete 2>/dev/null && echo "Deleted ASG" || true
+
+          echo "Waiting for EC2 instances to terminate..."
+          for i in $(seq 1 24); do
+            INSTANCES=$(aws ec2 describe-instances               --filters "Name=tag:aws:autoscaling:groupName,Values=${PROJECT}-ecs-asg"                         "Name=instance-state-name,Values=running,stopping,shutting-down,pending"               --query 'length(Reservations)' --output text 2>/dev/null || echo "0")
+            [[ "$INSTANCES" == "0" || "$INSTANCES" == "None" ]] && echo "✅ All instances terminated" && break
+            echo "  Waiting for $INSTANCES instance(s) to terminate..."
+            sleep 10
+          done
+
+          # ── Step 3: ALB ───────────────────────────────────────────────────
+          echo "--- ALB ---"
+          ALB_ARN=$(aws elbv2 describe-load-balancers             --names "${PROJECT}-alb"             --query 'LoadBalancers[0].LoadBalancerArn'             --output text 2>/dev/null || echo "")
+          if [[ -n "$ALB_ARN" && "$ALB_ARN" != "None" ]]; then
+            for LISTENER in $(aws elbv2 describe-listeners               --load-balancer-arn "$ALB_ARN"               --query 'Listeners[*].ListenerArn' --output text 2>/dev/null); do
+              aws elbv2 delete-listener --listener-arn "$LISTENER" 2>/dev/null || true
+            done
+            aws elbv2 delete-load-balancer --load-balancer-arn "$ALB_ARN" 2>/dev/null               && echo "Deleted ALB" || true
+            echo "Waiting for ALB deletion..."
+            sleep 20
+          fi
+          for ENV in dev staging prod; do
+            TG_ARN=$(aws elbv2 describe-target-groups               --names "${PROJECT}-${ENV}-tg"               --query 'TargetGroups[0].TargetGroupArn'               --output text 2>/dev/null || echo "")
+            [[ -n "$TG_ARN" && "$TG_ARN" != "None" ]] &&               aws elbv2 delete-target-group --target-group-arn "$TG_ARN" 2>/dev/null               && echo "Deleted TG ${ENV}" || true
+          done
+
+          # ── Step 4: All cicd-demo VPCs ────────────────────────────────────
+          echo "--- VPCs ---"
+          for VPC_ID in $(aws ec2 describe-vpcs             --filters "Name=tag:Name,Values=${PROJECT}-vpc"             --query 'Vpcs[*].VpcId' --output text 2>/dev/null); do
+            delete_vpc "$VPC_ID"
+          done
+
+          # ── Step 5: Release orphaned EIPs ─────────────────────────────────
+          for EIP in $(aws ec2 describe-addresses             --filters "Name=tag:Name,Values=${PROJECT}-*"             --query 'Addresses[?AssociationId==null].AllocationId'             --output text 2>/dev/null); do
+            aws ec2 release-address --allocation-id "$EIP" 2>/dev/null               && echo "Released EIP: $EIP" || true
+          done
+
+          # ── Step 6: Launch templates ───────────────────────────────────────
+          for LT in $(aws ec2 describe-launch-templates             --filters "Name=launch-template-name,Values=${PROJECT}-ecs-*"             --query 'LaunchTemplates[*].LaunchTemplateId' --output text 2>/dev/null); do
+            aws ec2 delete-launch-template --launch-template-id "$LT" 2>/dev/null               && echo "Deleted launch template: $LT" || true
+          done
+
+          VPC_COUNT=$(aws ec2 describe-vpcs --query 'length(Vpcs)' --output text)
+          echo "=== Done. VPC count: $VPC_COUNT/5 ==="
+          if [[ "$VPC_COUNT" -ge 5 ]]; then
+            echo "❌ Still at VPC limit"
+            exit 1
+          fi
+
       - name: Bootstrap Terraform state backend
         run: |
           BUCKET="${{ vars.TF_STATE_BUCKET }}"
@@ -226,131 +351,6 @@ jobs:
           if   [[ $EXIT -eq 0 ]]; then echo "result=no_changes" >> "$GITHUB_OUTPUT"
           elif [[ $EXIT -eq 2 ]]; then echo "result=changes"    >> "$GITHUB_OUTPUT"
           else exit 1
-          fi
-
-      # ── Clean up unused VPCs to avoid hitting the 5-VPC account limit ────────
-      - name: Clean up all orphaned cicd-demo resources
-        run: |
-          PROJECT="${{ vars.PROJECT_NAME }}"
-
-          echo "=== Cleaning up all orphaned ${PROJECT} resources ==="
-
-          # ── Helper: delete a VPC and all its dependencies ─────────────────
-          delete_vpc() {
-            local VPC_ID="$1"
-            echo "Deleting VPC: $VPC_ID"
-
-            # NAT gateways first (longest to delete)
-            for NAT in $(aws ec2 describe-nat-gateways               --filter "Name=vpc-id,Values=$VPC_ID" "Name=state,Values=available,pending"               --query 'NatGateways[*].NatGatewayId' --output text 2>/dev/null); do
-              aws ec2 delete-nat-gateway --nat-gateway-id "$NAT" 2>/dev/null &&                 echo "  Deleting NAT: $NAT" || true
-            done
-
-            # Wait for NAT gateways to finish
-            for i in $(seq 1 24); do
-              PENDING=$(aws ec2 describe-nat-gateways                 --filter "Name=vpc-id,Values=$VPC_ID"                          "Name=state,Values=available,pending,deleting"                 --query 'length(NatGateways)' --output text 2>/dev/null || echo "0")
-              [[ "$PENDING" == "0" || "$PENDING" == "None" ]] && break
-              echo "  Waiting for NAT ($PENDING remaining)..."
-              sleep 10
-            done
-
-            # Network interfaces — wait for them to detach/delete
-            for i in $(seq 1 12); do
-              ENI_COUNT=$(aws ec2 describe-network-interfaces                 --filters "Name=vpc-id,Values=$VPC_ID"                           "Name=status,Values=in-use"                 --query 'length(NetworkInterfaces)' --output text 2>/dev/null || echo "0")
-              [[ "$ENI_COUNT" == "0" || "$ENI_COUNT" == "None" ]] && break
-              echo "  Waiting for $ENI_COUNT ENI(s) to detach..."
-              sleep 10
-            done
-
-            # Delete remaining ENIs explicitly
-            for ENI in $(aws ec2 describe-network-interfaces               --filters "Name=vpc-id,Values=$VPC_ID"               --query 'NetworkInterfaces[?Status!=`in-use`].NetworkInterfaceId'               --output text 2>/dev/null); do
-              aws ec2 delete-network-interface --network-interface-id "$ENI" 2>/dev/null || true
-            done
-
-            # Subnets
-            for SUBNET in $(aws ec2 describe-subnets               --filters "Name=vpc-id,Values=$VPC_ID"               --query 'Subnets[*].SubnetId' --output text 2>/dev/null); do
-              aws ec2 delete-subnet --subnet-id "$SUBNET" 2>/dev/null || true
-            done
-
-            # IGWs
-            for IGW in $(aws ec2 describe-internet-gateways               --filters "Name=attachment.vpc-id,Values=$VPC_ID"               --query 'InternetGateways[*].InternetGatewayId' --output text 2>/dev/null); do
-              aws ec2 detach-internet-gateway --internet-gateway-id "$IGW"                 --vpc-id "$VPC_ID" 2>/dev/null || true
-              aws ec2 delete-internet-gateway --internet-gateway-id "$IGW" 2>/dev/null || true
-            done
-
-            # Route tables (non-main)
-            for RT in $(aws ec2 describe-route-tables               --filters "Name=vpc-id,Values=$VPC_ID"               --query 'RouteTables[?!Associations[?Main==`true`]].RouteTableId'               --output text 2>/dev/null); do
-              aws ec2 delete-route-table --route-table-id "$RT" 2>/dev/null || true
-            done
-
-            # Security groups (non-default) — revoke rules first to break dependencies
-            for SG in $(aws ec2 describe-security-groups               --filters "Name=vpc-id,Values=$VPC_ID"               --query 'SecurityGroups[?GroupName!=`default`].GroupId'               --output text 2>/dev/null); do
-              # Revoke all ingress and egress rules first
-              aws ec2 revoke-security-group-ingress --group-id "$SG"                 --ip-permissions "$(aws ec2 describe-security-groups                   --group-ids "$SG"                   --query 'SecurityGroups[0].IpPermissions'                   --output json 2>/dev/null)" 2>/dev/null || true
-              aws ec2 revoke-security-group-egress --group-id "$SG"                 --ip-permissions "$(aws ec2 describe-security-groups                   --group-ids "$SG"                   --query 'SecurityGroups[0].IpPermissionsEgress'                   --output json 2>/dev/null)" 2>/dev/null || true
-              aws ec2 delete-security-group --group-id "$SG" 2>/dev/null || true
-            done
-
-            aws ec2 delete-vpc --vpc-id "$VPC_ID" 2>/dev/null               && echo "  ✅ Deleted VPC $VPC_ID"               || echo "  ⚠️  Could not delete VPC $VPC_ID — may need another pass"
-          }
-
-          # ── Step 1: ECS ───────────────────────────────────────────────────
-          echo "--- ECS ---"
-          for SVC in dev staging prod; do
-            aws ecs update-service --cluster "${PROJECT}-cluster"               --service "${PROJECT}-${SVC}" --desired-count 0 2>/dev/null || true
-            aws ecs delete-service --cluster "${PROJECT}-cluster"               --service "${PROJECT}-${SVC}" --force 2>/dev/null               && echo "Deleted ECS service ${SVC}" || true
-          done
-          aws ecs put-cluster-capacity-providers             --cluster "${PROJECT}-cluster"             --capacity-providers []             --default-capacity-provider-strategy [] 2>/dev/null || true
-          aws ecs delete-cluster --cluster "${PROJECT}-cluster" 2>/dev/null             && echo "Deleted ECS cluster" || true
-
-          # ── Step 2: ASG — force delete and wait for instances to terminate ─
-          echo "--- ASG ---"
-          aws autoscaling delete-auto-scaling-group             --auto-scaling-group-name "${PROJECT}-ecs-asg"             --force-delete 2>/dev/null && echo "Deleted ASG" || true
-
-          echo "Waiting for EC2 instances to terminate..."
-          for i in $(seq 1 24); do
-            INSTANCES=$(aws ec2 describe-instances               --filters "Name=tag:aws:autoscaling:groupName,Values=${PROJECT}-ecs-asg"                         "Name=instance-state-name,Values=running,stopping,shutting-down,pending"               --query 'length(Reservations)' --output text 2>/dev/null || echo "0")
-            [[ "$INSTANCES" == "0" || "$INSTANCES" == "None" ]] && echo "✅ All instances terminated" && break
-            echo "  Waiting for $INSTANCES instance(s) to terminate..."
-            sleep 10
-          done
-
-          # ── Step 3: ALB ───────────────────────────────────────────────────
-          echo "--- ALB ---"
-          ALB_ARN=$(aws elbv2 describe-load-balancers             --names "${PROJECT}-alb"             --query 'LoadBalancers[0].LoadBalancerArn'             --output text 2>/dev/null || echo "")
-          if [[ -n "$ALB_ARN" && "$ALB_ARN" != "None" ]]; then
-            for LISTENER in $(aws elbv2 describe-listeners               --load-balancer-arn "$ALB_ARN"               --query 'Listeners[*].ListenerArn' --output text 2>/dev/null); do
-              aws elbv2 delete-listener --listener-arn "$LISTENER" 2>/dev/null || true
-            done
-            aws elbv2 delete-load-balancer --load-balancer-arn "$ALB_ARN" 2>/dev/null               && echo "Deleted ALB" || true
-            echo "Waiting for ALB deletion..."
-            sleep 20
-          fi
-          for ENV in dev staging prod; do
-            TG_ARN=$(aws elbv2 describe-target-groups               --names "${PROJECT}-${ENV}-tg"               --query 'TargetGroups[0].TargetGroupArn'               --output text 2>/dev/null || echo "")
-            [[ -n "$TG_ARN" && "$TG_ARN" != "None" ]] &&               aws elbv2 delete-target-group --target-group-arn "$TG_ARN" 2>/dev/null               && echo "Deleted TG ${ENV}" || true
-          done
-
-          # ── Step 4: All cicd-demo VPCs ────────────────────────────────────
-          echo "--- VPCs ---"
-          for VPC_ID in $(aws ec2 describe-vpcs             --filters "Name=tag:Name,Values=${PROJECT}-vpc"             --query 'Vpcs[*].VpcId' --output text 2>/dev/null); do
-            delete_vpc "$VPC_ID"
-          done
-
-          # ── Step 5: Release orphaned EIPs ─────────────────────────────────
-          for EIP in $(aws ec2 describe-addresses             --filters "Name=tag:Name,Values=${PROJECT}-*"             --query 'Addresses[?AssociationId==null].AllocationId'             --output text 2>/dev/null); do
-            aws ec2 release-address --allocation-id "$EIP" 2>/dev/null               && echo "Released EIP: $EIP" || true
-          done
-
-          # ── Step 6: Launch templates ───────────────────────────────────────
-          for LT in $(aws ec2 describe-launch-templates             --filters "Name=launch-template-name,Values=${PROJECT}-ecs-*"             --query 'LaunchTemplates[*].LaunchTemplateId' --output text 2>/dev/null); do
-            aws ec2 delete-launch-template --launch-template-id "$LT" 2>/dev/null               && echo "Deleted launch template: $LT" || true
-          done
-
-          VPC_COUNT=$(aws ec2 describe-vpcs --query 'length(Vpcs)' --output text)
-          echo "=== Done. VPC count: $VPC_COUNT/5 ==="
-          if [[ "$VPC_COUNT" -ge 5 ]]; then
-            echo "❌ Still at VPC limit"
-            exit 1
           fi
 
       - name: Terraform Apply
