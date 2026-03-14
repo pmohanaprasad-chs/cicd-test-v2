@@ -1,0 +1,208 @@
+# .github/workflows/_deploy-env.yml
+# ============================================================================
+# REUSABLE WORKFLOW — Deploy a pre-built image to ONE environment.
+#
+# Called by deploy.yml for each of: dev, staging, prod
+# The image is always referenced by digest (immutable) — never by mutable tag.
+# APP_ENV is injected at runtime via jq-patched task definition.
+# ============================================================================
+name: _Deploy Environment
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Environment name (dev | staging | prod)'
+        required: true
+        type: string
+      app_env:
+        description: 'Value for APP_ENV runtime variable'
+        required: true
+        type: string
+      aws_region:
+        description: 'AWS region'
+        required: true
+        type: string
+      project_name:
+        description: 'Project name'
+        required: true
+        type: string
+      image_digest:
+        description: 'Full image digest (sha256:...)'
+        required: true
+        type: string
+      build_sha:
+        description: 'Git SHA for BUILD_SHA env var'
+        required: true
+        type: string
+      run_number:
+        description: 'GitHub run number (for Jira comment)'
+        required: true
+        type: string
+      jira_key:
+        description: 'Jira ticket key'
+        required: false
+        type: string
+        default: ''
+      smoke_test_url:
+        description: 'URL to smoke test after deploy'
+        required: true
+        type: string
+      wait_minutes:
+        description: 'Minutes to wait for ECS stability'
+        required: false
+        type: string
+        default: '20'
+
+    secrets:
+      IAM_ROLE_ARN:
+        description: "OIDC role ARN in this env's AWS account"
+        required: true
+      ECR_REGISTRY:
+        description: 'ECR registry URL (prod account)'
+        required: true
+      ECR_REPOSITORY:
+        description: 'ECR repository name'
+        required: true
+      ECS_CLUSTER:
+        description: 'ECS cluster name'
+        required: true
+      ECS_SERVICE:
+        description: 'ECS service name'
+        required: true
+      ECS_TASK_FAMILY:
+        description: 'ECS task definition family'
+        required: true
+      # ── Jira (optional) ─────────────────────────────────────────────────
+      JIRA_BASE_URL:
+        required: false
+      JIRA_EMAIL:
+        required: false
+      JIRA_API_TOKEN:
+        required: false
+      # ── Git (required for branch promotion) ──────────────────────────────
+      GH_PAT:
+        required: false
+
+jobs:
+  deploy:
+    name: Deploy → ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    permissions:
+      id-token: write
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT || github.token }}
+
+      # ── Branch promotion ─────────────────────────────────────────────────────
+      # dev     ← triggered from source branch (no merge needed)
+      # staging ← merge dev → staging
+      # prod    ← merge staging → main
+      - name: Promote branch
+        if: inputs.environment != 'dev'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if [[ "${{ inputs.environment }}" == "staging" ]]; then
+            SOURCE="dev"
+            TARGET="staging"
+          else
+            SOURCE="staging"
+            TARGET="main"
+          fi
+
+          git checkout "$TARGET" 2>/dev/null || git checkout -b "$TARGET"
+          git merge "origin/${SOURCE}" --no-edit \
+            -m "chore: promote ${SOURCE} → ${TARGET} [skip ci]"
+          git push origin "$TARGET"
+          echo "✅ Merged ${SOURCE} → ${TARGET}"
+
+      # ── AWS auth ─────────────────────────────────────────────────────────────
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.IAM_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+          role-session-name: deploy-${{ inputs.environment }}-${{ github.run_id }}
+          role-duration-seconds: 3600
+
+      - name: Login to ECR (prod account — cross-account pull)
+        id: ecr-login
+        run: |
+          # The ECR registry lives in the prod account.
+          # Each env account's task execution role has cross-account pull permission.
+          # We log in using the current (env) account credentials which have
+          # ecr:GetAuthorizationToken on the prod account registry.
+          aws ecr get-login-password --region ${{ inputs.aws_region }} | \
+            docker login --username AWS \
+              --password-stdin ${{ secrets.ECR_REGISTRY }}
+          echo "registry=${{ secrets.ECR_REGISTRY }}" >> "$GITHUB_OUTPUT"
+
+      # ── Task definition ───────────────────────────────────────────────────────
+      - name: Download & patch task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "${{ secrets.ECS_TASK_FAMILY }}" \
+            --query taskDefinition \
+            --output json > task-def.json
+
+          # Inject runtime env vars — no values hardcoded here
+          jq '(.containerDefinitions[0].environment) |=
+            (map(select(.name != "APP_ENV" and .name != "BUILD_SHA")) +
+            [{"name":"APP_ENV",   "value":"${{ inputs.app_env }}"},
+             {"name":"BUILD_SHA", "value":"${{ inputs.build_sha }}"}])' \
+            task-def.json > task-def-patched.json
+          mv task-def-patched.json task-def.json
+
+          echo "✅ Patched APP_ENV=${{ inputs.app_env }} BUILD_SHA=${{ inputs.build_sha }}"
+
+      - name: Render new task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-def.json
+          container-name: ${{ inputs.project_name }}-app
+          image: ${{ secrets.ECR_REGISTRY }}/${{ secrets.ECR_REPOSITORY }}@${{ inputs.image_digest }}
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ secrets.ECS_SERVICE }}
+          cluster: ${{ secrets.ECS_CLUSTER }}
+          wait-for-service-stability: true
+          wait-for-minutes: ${{ inputs.wait_minutes }}
+
+      # ── Smoke test ────────────────────────────────────────────────────────────
+      - name: Smoke test
+        run: bash scripts/smoke-test.sh "${{ inputs.smoke_test_url }}"
+
+      # ── Jira comment (optional) ───────────────────────────────────────────────
+      - name: Jira comment
+        if: inputs.jira_key != ''
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          SHORT_SHA=$(echo "${{ inputs.build_sha }}" | cut -c1-7)
+          node scripts/jira-transition.js \
+            --action comment \
+            --key "${{ inputs.jira_key }}" \
+            --comment "✅ Deployed to ${{ inputs.environment }} — Build #${{ inputs.run_number }} | SHA: ${SHORT_SHA}
+          URL: ${{ inputs.smoke_test_url }}
+          Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Summary
+        run: |
+          echo "## ✅ Deployed to ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "URL: ${{ inputs.smoke_test_url }}"           >> $GITHUB_STEP_SUMMARY
+          echo "SHA: ${{ inputs.build_sha }}"                >> $GITHUB_STEP_SUMMARY

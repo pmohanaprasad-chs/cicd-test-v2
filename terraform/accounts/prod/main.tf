@@ -4,13 +4,12 @@
 #
 # Resources created here:
 #   - ECR repository (images built here, pulled cross-account by dev/staging)
-#   - OIDC provider (GitHub Actions auth)
-#   - IAM github-actions role (used by CI to push images + run Terraform)
 #   - VPC + subnets + NAT gateway
 #   - ECS cluster + EC2 ASG
 #   - ALB with path-based routing (/ → prod service)
 #   - ECS service: prod
 #   - IAM roles for ECS tasks
+#   - OIDC + github-actions role (for this account's deploy jobs)
 #   - CloudWatch log groups
 # ============================================================================
 
@@ -19,7 +18,6 @@ terraform {
   required_providers {
     aws = { source = "hashicorp/aws", version = "~> 5.50" }
   }
-  # Backend configured via -backend-config flags in CI — no hardcoded values
   backend "s3" {}
 }
 
@@ -78,8 +76,7 @@ module "iam" {
   role_type    = "tooling"
 
   # ECR arn for scoped push permissions
-  ecr_repository_arn = module.ecr.repository_arn
-
+  ecr_repository_arn      = module.ecr.repository_arn
   ecs_cluster_arn         = module.ecs.cluster_arn
   task_execution_role_arn = module.ecs.task_execution_role_arn
 }
@@ -112,8 +109,8 @@ module "ecs" {
 # ── Outputs ───────────────────────────────────────────────────────────────────
 output "ecr_repository_url"      { value = module.ecr.repository_url }
 output "ecr_repository_arn"      { value = module.ecr.repository_arn }
-output "github_actions_role_arn" { value = module.iam.github_actions_role_arn }
 output "alb_dns_name"            { value = module.ecs.alb_dns_name }
 output "ecs_cluster_name"        { value = module.ecs.cluster_name }
 output "ecs_service_prod"        { value = module.ecs.service_name }
 output "task_family_prod"        { value = module.ecs.task_family }
+output "github_actions_role_arn" { value = module.iam.github_actions_role_arn }

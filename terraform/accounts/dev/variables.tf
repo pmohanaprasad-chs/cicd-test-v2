@@ -1,45 +1,47 @@
-# terraform/accounts/prod/variables.tf
+# terraform/accounts/dev/variables.tf
 
 variable "aws_region" {
-  description = "AWS region"
-  type        = string
-  default     = "us-east-1"
+  type    = string
+  default = "us-east-1"
 }
 
 variable "project_name" {
-  description = "Short name used to prefix all resources (e.g. my-app)"
-  type        = string
+  type = string
 }
 
 variable "environment" {
-  description = "Account environment label"
-  type        = string
-  default     = "prod"
+  type    = string
+  default = "dev"
 }
 
 variable "github_org" {
-  description = "GitHub organisation or username (for OIDC trust)"
-  type        = string
+  type = string
 }
 
 variable "github_repo" {
-  description = "GitHub repository name (for OIDC trust)"
-  type        = string
+  type = string
 }
 
-# ── Cross-account ECR pull ────────────────────────────────────────────────────
-variable "env_account_ids" {
-  description = "AWS account IDs allowed to pull images from ECR (dev/staging)"
-  type        = list(string)
-  default     = []
-  # Set these in GitHub vars: PROD_ENV_ACCOUNT_IDS (comma-separated)
-  # e.g. ["111111111111", "222222222222"]
+# ── Prod account references ───────────────────────────────────────────────────
+variable "tooling_ecr_url" {
+  description = "ECR repository URL in prod account"
+  type        = string
+  default     = ""
+  # Set via GitHub var: PROD_ECR_URL
+  # e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/my-app
+}
+
+variable "tooling_ecr_arn" {
+  description = "ECR repository ARN in prod account (for IAM cross-account pull)"
+  type        = string
+  default     = ""
+  # Set via GitHub var: PROD_ECR_ARN
 }
 
 # ── Networking ────────────────────────────────────────────────────────────────
 variable "vpc_cidr" {
   type    = string
-  default = "10.0.0.0/16"
+  default = "10.1.0.0/16"   # dev uses 10.1.x.x to avoid overlap
 }
 
 variable "availability_zones" {
@@ -49,12 +51,12 @@ variable "availability_zones" {
 
 variable "public_subnet_cidrs" {
   type    = list(string)
-  default = ["10.0.0.0/24", "10.0.1.0/24"]
+  default = ["10.1.0.0/24", "10.1.1.0/24"]
 }
 
 variable "private_subnet_cidrs" {
   type    = list(string)
-  default = ["10.0.10.0/24", "10.0.11.0/24"]
+  default = ["10.1.10.0/24", "10.1.11.0/24"]
 }
 
 # ── ECS ───────────────────────────────────────────────────────────────────────

@@ -1,29 +1,11 @@
 # .github/workflows/destroy.yml
 # ============================================================================
-# Destroy — tears down ALL AWS infrastructure created by Terraform
+# DESTROY PIPELINE
 #
-# Triggered ONLY manually via workflow_dispatch.
-# Requires typing "destroy" as confirmation to prevent accidents.
+# Tears down infrastructure in one or all accounts.
+# Triggered manually only — requires typing "destroy" to confirm.
 #
-# What gets deleted:
-#   - ECS services (dev, staging, prod)
-#   - ECS cluster + capacity provider + ASG
-#   - ALB + target groups + listeners
-#   - ECR repository (and all images inside)
-#   - VPC + subnets + NAT gateway + route tables
-#   - CloudWatch log groups
-#   - Security groups
-#   - IAM roles + policies (EXCEPT github-actions role — needed for OIDC)
-#
-# What is NEVER deleted (required to run this workflow):
-#   - OIDC provider  ← deleting this breaks ALL future workflow runs
-#   - IAM github-actions role + policy ← deleting this breaks OIDC auth
-#
-# Also handles:
-#   - Unused VPC cleanup (prevents hitting AWS 5 VPC limit)
-#
-# What is optionally deleted:
-#   - S3 state bucket + DynamoDB lock table (checkbox)
+# OIDC provider + github-actions IAM role are NEVER deleted.
 # ============================================================================
 name: Destroy Infrastructure
 
@@ -31,370 +13,83 @@ on:
   workflow_dispatch:
     inputs:
       confirm:
-        description: "Type 'destroy' to confirm you want to delete everything"
+        description: "Type 'destroy' to confirm"
         required: true
         type: string
+      target_env:
+        description: 'Which account to destroy'
+        required: true
+        type: choice
+        options: [all, dev, staging, prod]
       delete_state_backend:
-        description: 'Also delete S3 state bucket and DynamoDB table?'
+        description: 'Also delete S3 + DynamoDB state backend?'
         required: false
         type: boolean
         default: false
 
 env:
   TF_VERSION: '1.7.5'
-  AWS_REGION: ${{ vars.AWS_REGION }}
 
 jobs:
-  destroy:
-    name: Terraform Destroy
+  # ── Safety gate ─────────────────────────────────────────────────────────────
+  confirm:
+    name: Confirm destroy
     runs-on: ubuntu-latest
-    environment: dev
-
-    permissions:
-      id-token: write
-      contents: read
-
     steps:
-      # ── Safety check ────────────────────────────────────────────────────────
-      - name: Confirm destroy
+      - name: Check confirmation
         if: inputs.confirm != 'destroy'
         run: |
-          echo "❌ Confirmation failed. You typed: '${{ inputs.confirm }}'"
-          echo "You must type exactly: destroy"
+          echo "❌ You typed: '${{ inputs.confirm }}' — must be exactly: destroy"
           exit 1
 
-      - name: Checkout
-        uses: actions/checkout@v4
+  # ── Per-account destroy jobs ─────────────────────────────────────────────────
+  destroy-dev:
+    name: Destroy dev
+    needs: confirm
+    if: inputs.target_env == 'all' || inputs.target_env == 'dev'
+    uses: ./.github/workflows/_destroy-account.yml
+    with:
+      environment: dev
+      tf_state_key: '${{ vars.PROJECT_NAME }}/dev/terraform.tfstate'
+      aws_region: ${{ vars.AWS_REGION }}
+      project_name: ${{ vars.PROJECT_NAME }}
+      delete_state_backend: ${{ inputs.delete_state_backend }}
+      tf_version: '1.7.5'
+    secrets:
+      IAM_ROLE_ARN: ${{ vars.DEV_IAM_ROLE_ARN }}
+      TF_STATE_BUCKET: ${{ vars.DEV_TF_STATE_BUCKET }}
+      TF_LOCK_TABLE: ${{ vars.DEV_TF_LOCK_TABLE }}
 
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ vars.IAM_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-          role-session-name: tf-destroy-${{ github.run_id }}
-          role-duration-seconds: 7200
+  destroy-staging:
+    name: Destroy staging
+    needs: confirm
+    if: inputs.target_env == 'all' || inputs.target_env == 'staging'
+    uses: ./.github/workflows/_destroy-account.yml
+    with:
+      environment: staging
+      tf_state_key: '${{ vars.PROJECT_NAME }}/staging/terraform.tfstate'
+      aws_region: ${{ vars.AWS_REGION }}
+      project_name: ${{ vars.PROJECT_NAME }}
+      delete_state_backend: ${{ inputs.delete_state_backend }}
+      tf_version: '1.7.5'
+    secrets:
+      IAM_ROLE_ARN: ${{ vars.STAGING_IAM_ROLE_ARN }}
+      TF_STATE_BUCKET: ${{ vars.STAGING_TF_STATE_BUCKET }}
+      TF_LOCK_TABLE: ${{ vars.STAGING_TF_LOCK_TABLE }}
 
-      # ── Clean up unused VPCs to avoid VPC limit (default limit = 5) ──────────
-      # ── Clean up all orphaned cicd-demo resources before destroy ──────────────
-      - name: Clean up orphaned resources
-        run: |
-          PROJECT="${{ vars.PROJECT_NAME }}"
-
-          echo "=== Cleaning up all orphaned ${PROJECT} resources ==="
-
-          delete_vpc() {
-            local VPC_ID="$1"
-            echo "Deleting VPC: $VPC_ID"
-            for NAT in $(aws ec2 describe-nat-gateways \
-              --filter "Name=vpc-id,Values=$VPC_ID" "Name=state,Values=available,pending" \
-              --query 'NatGateways[*].NatGatewayId' --output text 2>/dev/null); do
-              aws ec2 delete-nat-gateway --nat-gateway-id "$NAT" 2>/dev/null || true
-            done
-            for i in $(seq 1 24); do
-              PENDING=$(aws ec2 describe-nat-gateways \
-                --filter "Name=vpc-id,Values=$VPC_ID" "Name=state,Values=available,pending,deleting" \
-                --query 'length(NatGateways)' --output text 2>/dev/null || echo "0")
-              [[ "$PENDING" == "0" || "$PENDING" == "None" ]] && break
-              echo "  Waiting for NAT ($PENDING remaining)..."; sleep 10
-            done
-            for i in $(seq 1 12); do
-              ENI_COUNT=$(aws ec2 describe-network-interfaces \
-                --filters "Name=vpc-id,Values=$VPC_ID" "Name=status,Values=in-use" \
-                --query 'length(NetworkInterfaces)' --output text 2>/dev/null || echo "0")
-              [[ "$ENI_COUNT" == "0" || "$ENI_COUNT" == "None" ]] && break
-              echo "  Waiting for $ENI_COUNT ENI(s)..."; sleep 10
-            done
-            for SUBNET in $(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" \
-              --query 'Subnets[*].SubnetId' --output text 2>/dev/null); do
-              aws ec2 delete-subnet --subnet-id "$SUBNET" 2>/dev/null || true
-            done
-            for IGW in $(aws ec2 describe-internet-gateways \
-              --filters "Name=attachment.vpc-id,Values=$VPC_ID" \
-              --query 'InternetGateways[*].InternetGatewayId' --output text 2>/dev/null); do
-              aws ec2 detach-internet-gateway --internet-gateway-id "$IGW" --vpc-id "$VPC_ID" 2>/dev/null || true
-              aws ec2 delete-internet-gateway --internet-gateway-id "$IGW" 2>/dev/null || true
-            done
-            for RT in $(aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$VPC_ID" \
-              --query 'RouteTables[?!Associations[?Main==`true`]].RouteTableId' \
-              --output text 2>/dev/null); do
-              aws ec2 delete-route-table --route-table-id "$RT" 2>/dev/null || true
-            done
-            for SG in $(aws ec2 describe-security-groups --filters "Name=vpc-id,Values=$VPC_ID" \
-              --query 'SecurityGroups[?GroupName!=`default`].GroupId' --output text 2>/dev/null); do
-              INGRESS=$(aws ec2 describe-security-groups --group-ids "$SG" \
-                --query 'SecurityGroups[0].IpPermissions' --output json 2>/dev/null || echo "[]")
-              EGRESS=$(aws ec2 describe-security-groups --group-ids "$SG" \
-                --query 'SecurityGroups[0].IpPermissionsEgress' --output json 2>/dev/null || echo "[]")
-              [[ "$INGRESS" != "[]" ]] && \
-                aws ec2 revoke-security-group-ingress --group-id "$SG" --ip-permissions "$INGRESS" 2>/dev/null || true
-              [[ "$EGRESS" != "[]" ]] && \
-                aws ec2 revoke-security-group-egress --group-id "$SG" --ip-permissions "$EGRESS" 2>/dev/null || true
-              aws ec2 delete-security-group --group-id "$SG" 2>/dev/null || true
-            done
-            aws ec2 delete-vpc --vpc-id "$VPC_ID" 2>/dev/null \
-              && echo "  ✅ Deleted $VPC_ID" || echo "  ⚠️  Could not delete $VPC_ID"
-          }
-
-          # ECS
-          for SVC in dev staging prod; do
-            aws ecs update-service --cluster "${PROJECT}-cluster" \
-              --service "${PROJECT}-${SVC}" --desired-count 0 2>/dev/null || true
-            aws ecs delete-service --cluster "${PROJECT}-cluster" \
-              --service "${PROJECT}-${SVC}" --force 2>/dev/null || true
-          done
-          aws ecs put-cluster-capacity-providers --cluster "${PROJECT}-cluster" \
-            --capacity-providers [] --default-capacity-provider-strategy [] 2>/dev/null || true
-          aws ecs delete-cluster --cluster "${PROJECT}-cluster" 2>/dev/null || true
-
-          # ASG + wait for instances
-          aws autoscaling delete-auto-scaling-group \
-            --auto-scaling-group-name "${PROJECT}-ecs-asg" --force-delete 2>/dev/null || true
-          for i in $(seq 1 24); do
-            INSTANCES=$(aws ec2 describe-instances \
-              --filters "Name=tag:aws:autoscaling:groupName,Values=${PROJECT}-ecs-asg" \
-                        "Name=instance-state-name,Values=running,stopping,shutting-down,pending" \
-              --query 'length(Reservations)' --output text 2>/dev/null || echo "0")
-            [[ "$INSTANCES" == "0" || "$INSTANCES" == "None" ]] && echo "✅ Instances terminated" && break
-            echo "  Waiting for $INSTANCES instance(s)..."; sleep 10
-          done
-
-          # ALB
-          ALB_ARN=$(aws elbv2 describe-load-balancers --names "${PROJECT}-alb" \
-            --query 'LoadBalancers[0].LoadBalancerArn' --output text 2>/dev/null || echo "")
-          if [[ -n "$ALB_ARN" && "$ALB_ARN" != "None" ]]; then
-            for LISTENER in $(aws elbv2 describe-listeners --load-balancer-arn "$ALB_ARN" \
-              --query 'Listeners[*].ListenerArn' --output text 2>/dev/null); do
-              aws elbv2 delete-listener --listener-arn "$LISTENER" 2>/dev/null || true
-            done
-            aws elbv2 delete-load-balancer --load-balancer-arn "$ALB_ARN" 2>/dev/null && \
-              echo "Deleted ALB" || true
-            sleep 20
-          fi
-          for ENV in dev staging prod; do
-            TG_ARN=$(aws elbv2 describe-target-groups --names "${PROJECT}-${ENV}-tg" \
-              --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null || echo "")
-            [[ -n "$TG_ARN" && "$TG_ARN" != "None" ]] && \
-              aws elbv2 delete-target-group --target-group-arn "$TG_ARN" 2>/dev/null || true
-          done
-
-          # All project VPCs
-          for VPC_ID in $(aws ec2 describe-vpcs \
-            --filters "Name=tag:Name,Values=${PROJECT}-vpc" \
-            --query 'Vpcs[*].VpcId' --output text 2>/dev/null); do
-            delete_vpc "$VPC_ID"
-          done
-
-          # Release EIPs + launch templates
-          for EIP in $(aws ec2 describe-addresses \
-            --filters "Name=tag:Name,Values=${PROJECT}-*" \
-            --query 'Addresses[?AssociationId==null].AllocationId' --output text 2>/dev/null); do
-            aws ec2 release-address --allocation-id "$EIP" 2>/dev/null || true
-          done
-          for LT in $(aws ec2 describe-launch-templates \
-            --filters "Name=launch-template-name,Values=${PROJECT}-ecs-*" \
-            --query 'LaunchTemplates[*].LaunchTemplateId' --output text 2>/dev/null); do
-            aws ec2 delete-launch-template --launch-template-id "$LT" 2>/dev/null || true
-          done
-
-          echo "=== Done. VPC count: $(aws ec2 describe-vpcs --query 'length(Vpcs)' --output text)/5 ==="
-
-      # ── Scale down ECS services + wait for tasks to fully drain ─────────────
-      - name: Scale down ECS services and wait for drain
-        run: |
-          CLUSTER="${{ vars.PROJECT_NAME }}-cluster"
-
-          # Check cluster exists first
-          STATUS=$(aws ecs describe-clusters --clusters "$CLUSTER" \
-            --query 'clusters[0].status' --output text 2>/dev/null || echo "MISSING")
-
-          if [[ "$STATUS" != "ACTIVE" ]]; then
-            echo "⏭️  Cluster $CLUSTER not found or not active — skipping scale down"
-            exit 0
-          fi
-
-          for ENV in dev staging prod; do
-            SERVICE="${{ vars.PROJECT_NAME }}-${ENV}"
-            echo "Scaling down $SERVICE..."
-            aws ecs update-service \
-              --cluster "$CLUSTER" \
-              --service "$SERVICE" \
-              --desired-count 0 2>/dev/null \
-              && echo "✅ $SERVICE scaled to 0" \
-              || echo "⏭️  $SERVICE not found"
-          done
-
-          echo "Waiting for all tasks to stop (up to 3 mins)..."
-          for i in $(seq 1 18); do
-            RUNNING=$(aws ecs list-tasks --cluster "$CLUSTER" \
-              --query 'length(taskArns)' --output text 2>/dev/null || echo "0")
-            echo "  Tasks still running: $RUNNING"
-            if [[ "$RUNNING" == "0" ]]; then
-              echo "✅ All tasks stopped"
-              break
-            fi
-            sleep 10
-          done
-
-      # ── Remove OIDC provider + IAM role from Terraform state ────────────────
-      # These must NOT be destroyed — they are required for OIDC auth.
-      # We remove them from state so terraform destroy ignores them.
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-          terraform_wrapper: false
-
-      - name: Write tfvars
-        working-directory: terraform
-        run: |
-          cat > terraform.tfvars << EOF
-          aws_region   = "${{ env.AWS_REGION }}"
-          project_name = "${{ vars.PROJECT_NAME }}"
-          github_org   = "${{ vars.TF_GITHUB_ORG }}"
-          github_repo  = "${{ vars.TF_GITHUB_REPO }}"
-          EOF
-
-      # ── Fix corrupted state checksum (from previous failed destroy) ──────────
-      # When a previous run fails mid-destroy, DynamoDB holds a stale checksum
-      # that no longer matches S3. Clear it so terraform init can proceed.
-      - name: Fix state checksum if corrupted
-        run: |
-          BUCKET="${{ vars.TF_STATE_BUCKET }}"
-          TABLE="${{ vars.TF_LOCK_TABLE }}"
-          KEY="cicd-demo/terraform.tfstate"
-
-          TABLE_EXISTS=$(aws dynamodb list-tables --output text \
-            | tr '\t' '\n' | grep -x "$TABLE" || true)
-
-          if [[ -z "$TABLE_EXISTS" ]]; then
-            echo "⏭️  DynamoDB table not found — skipping checksum fix"
-            exit 0
-          fi
-
-          # Clear stale MD5 checksum
-          LOCK_KEY="${BUCKET}/${KEY}-md5"
-          ITEM=$(aws dynamodb get-item \
-            --table-name "$TABLE" \
-            --key "{\"LockID\": {\"S\": \"${LOCK_KEY}\"}}" \
-            --output json 2>/dev/null || echo "{}")
-
-          if echo "$ITEM" | jq -e '.Item' > /dev/null 2>&1; then
-            echo "🔧 Stale checksum found — removing"
-            aws dynamodb delete-item \
-              --table-name "$TABLE" \
-              --key "{\"LockID\": {\"S\": \"${LOCK_KEY}\"}}"
-            echo "✅ Checksum cleared"
-          else
-            echo "✅ No stale checksum"
-          fi
-
-          # Release any stuck state lock
-          LOCK_KEY2="${BUCKET}/${KEY}"
-          LOCK=$(aws dynamodb get-item \
-            --table-name "$TABLE" \
-            --key "{\"LockID\": {\"S\": \"${LOCK_KEY2}\"}}" \
-            --output json 2>/dev/null || echo "{}")
-
-          if echo "$LOCK" | jq -e '.Item' > /dev/null 2>&1; then
-            echo "🔧 Stuck state lock found — releasing"
-            aws dynamodb delete-item \
-              --table-name "$TABLE" \
-              --key "{\"LockID\": {\"S\": \"${LOCK_KEY2}\"}}"
-            echo "✅ Lock released"
-          else
-            echo "✅ No stuck lock"
-          fi
-
-      - name: Terraform Init
-        working-directory: terraform
-        run: |
-          terraform init \
-            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
-            -backend-config="key=cicd-demo/terraform.tfstate" \
-            -backend-config="region=${{ env.AWS_REGION }}" \
-            -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
-            -backend-config="encrypt=true"
-
-      - name: Remove OIDC + IAM role from Terraform state
-        working-directory: terraform
-        run: |
-          # Remove from state only — does NOT delete from AWS
-          # This prevents terraform destroy from touching these resources
-          terraform state rm module.iam.aws_iam_openid_connect_provider.github 2>/dev/null \
-            && echo "✅ Removed OIDC provider from state" \
-            || echo "⏭️  OIDC provider not in state"
-
-          terraform state rm module.iam.aws_iam_role.github_actions 2>/dev/null \
-            && echo "✅ Removed IAM role from state" \
-            || echo "⏭️  IAM role not in state"
-
-          terraform state rm module.iam.aws_iam_policy.github_actions 2>/dev/null \
-            && echo "✅ Removed IAM policy from state" \
-            || echo "⏭️  IAM policy not in state"
-
-          terraform state rm module.iam.aws_iam_role_policy_attachment.github_actions 2>/dev/null \
-            && echo "✅ Removed IAM policy attachment from state" \
-            || echo "⏭️  IAM policy attachment not in state"
-
-      # ── Terraform destroy ────────────────────────────────────────────────────
-      - name: Terraform Destroy
-        working-directory: terraform
-        run: |
-          terraform destroy \
-            -auto-approve \
-            -input=false
-          echo "✅ All Terraform-managed resources destroyed"
-
-      # ── Optionally delete state backend ─────────────────────────────────────
-      - name: Delete state backend
-        if: inputs.delete_state_backend == true
-        run: |
-          BUCKET="${{ vars.TF_STATE_BUCKET }}"
-          TABLE="${{ vars.TF_LOCK_TABLE }}"
-
-          echo "Deleting all objects in S3 bucket..."
-          aws s3 rm "s3://${BUCKET}" --recursive 2>/dev/null || true
-
-          echo "Deleting versioned objects..."
-          VERSIONS=$(aws s3api list-object-versions \
-            --bucket "$BUCKET" \
-            --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' \
-            --output json 2>/dev/null || echo '{"Objects":null}')
-
-          if echo "$VERSIONS" | jq -e '.Objects != null' > /dev/null 2>&1; then
-            aws s3api delete-objects --bucket "$BUCKET" --delete "$VERSIONS" 2>/dev/null || true
-          fi
-
-          echo "Deleting delete markers..."
-          MARKERS=$(aws s3api list-object-versions \
-            --bucket "$BUCKET" \
-            --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' \
-            --output json 2>/dev/null || echo '{"Objects":null}')
-
-          if echo "$MARKERS" | jq -e '.Objects != null' > /dev/null 2>&1; then
-            aws s3api delete-objects --bucket "$BUCKET" --delete "$MARKERS" 2>/dev/null || true
-          fi
-
-          aws s3api delete-bucket --bucket "$BUCKET" 2>/dev/null \
-            && echo "✅ Deleted S3 bucket: $BUCKET" || echo "⏭️  S3 bucket not found"
-
-          aws dynamodb delete-table --table-name "$TABLE" 2>/dev/null \
-            && echo "✅ Deleted DynamoDB table: $TABLE" || echo "⏭️  DynamoDB table not found"
-
-      - name: Summary
-        if: always()
-        run: |
-          echo "## 💥 Infrastructure Destroyed"              >> $GITHUB_STEP_SUMMARY
-          echo "Triggered by: ${{ github.actor }}"           >> $GITHUB_STEP_SUMMARY
-          echo "Time: $(date -u)"                            >> $GITHUB_STEP_SUMMARY
-          echo ""                                            >> $GITHUB_STEP_SUMMARY
-          echo "### ✅ Always kept (required for OIDC auth)" >> $GITHUB_STEP_SUMMARY
-          echo "- OIDC provider: token.actions.githubusercontent.com" >> $GITHUB_STEP_SUMMARY
-          echo "- IAM role: ${{ vars.PROJECT_NAME }}-github-actions"  >> $GITHUB_STEP_SUMMARY
-          echo ""                                            >> $GITHUB_STEP_SUMMARY
-          if [[ "${{ inputs.delete_state_backend }}" == "true" ]]; then
-            echo "### 🗑️ State backend deleted"             >> $GITHUB_STEP_SUMMARY
-          else
-            echo "### 💾 State backend kept"                >> $GITHUB_STEP_SUMMARY
-            echo "S3 + DynamoDB still exist for next run"   >> $GITHUB_STEP_SUMMARY
-          fi
+  destroy-prod:
+    name: Destroy prod
+    needs: [confirm, destroy-staging]
+    if: inputs.target_env == 'all' || inputs.target_env == 'prod'
+    uses: ./.github/workflows/_destroy-account.yml
+    with:
+      environment: prod
+      tf_state_key: '${{ vars.PROJECT_NAME }}/prod/terraform.tfstate'
+      aws_region: ${{ vars.AWS_REGION }}
+      project_name: ${{ vars.PROJECT_NAME }}
+      delete_state_backend: ${{ inputs.delete_state_backend }}
+      tf_version: '1.7.5'
+    secrets:
+      IAM_ROLE_ARN: ${{ vars.PROD_IAM_ROLE_ARN }}
+      TF_STATE_BUCKET: ${{ vars.PROD_TF_STATE_BUCKET }}
+      TF_LOCK_TABLE: ${{ vars.PROD_TF_LOCK_TABLE }}
