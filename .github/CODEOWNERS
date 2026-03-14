@@ -1,0 +1,2 @@
+# Require team or user review for deployment workflows
+.github/workflows/deploy.yml  @coharts-chs/pmohanaprasad-chs
